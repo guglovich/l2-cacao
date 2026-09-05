@@ -103,10 +103,11 @@ namespace dxvk {
                "# CACAO Ambient Occlusion settings\n"
                "# d3d9.cacaoEnable      = true      # set to false to disable CACAO entirely\n"
                "# d3d9.cacaoQuality     = 2         # 0=Lowest 1=Low 2=Medium 3=High\n"
-               "# d3d9.cacaoRadius      = 1.2       # effect radius in world units\n"
+               "# d3d9.cacaoRadius      = 1.2       # radius multiplier (x near plane ≈10 → world units)\n"
                "# d3d9.cacaoStrength    = 1.0       # shadow strength (0.0 - 2.0)\n"
                "# d3d9.cacaoShadowClamp = 0.98      # shadow clamp (0.0 - 1.0)\n"
                "# d3d9.cacaoHotkey      = Insert    # toggle key: Insert Delete ScrollLock Pause RightAlt RightCtrl None\n"
+               "# d3d9.cacaoDarkMask    = 0.7       # suppress AO on already-dark pixels (baked lightmaps: 0.0-1.0)\n"
                "# d3d9.cacaoDebugFill   = false     # DEBUG: fill AO with 0.5 grey (screen dims 50% if composite works)\n"
                "#\n"
                "# REQUIRED for CACAO: classic descriptor sets used by the CACAO\n"
@@ -119,6 +120,7 @@ namespace dxvk {
                "d3d9.cacaoStrength    = 1.0\n"
                "d3d9.cacaoShadowClamp = 0.98\n"
                "d3d9.cacaoHotkey      = Insert\n"
+               "d3d9.cacaoDarkMask    = 0.7\n"
                "#d3d9.cacaoDebugFill  = false\n";
           CacaoLogger::get().log("[INIT] dxvk.conf created with CACAO defaults");
         }

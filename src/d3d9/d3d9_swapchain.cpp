@@ -865,7 +865,8 @@ namespace dxvk {
     // the AO result into the blitter for composite during present.
     m_parent->TryApplyCACAO(swapImage->info().extent.width, swapImage->info().extent.height);
     m_blitter->setAoView(m_parent->GetCacaoAoView(),
-                         m_parent->GetOptions()->cacaoDebugView);
+                         m_parent->GetOptions()->cacaoDebugView,
+                         m_parent->GetOptions()->cacaoDarkMask);
 
     // Presentation semaphores and WSI swap chain image
     PresenterSync sync = { };

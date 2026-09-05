@@ -9544,6 +9544,18 @@ namespace dxvk {
       return;
     }
 
+    // Depth must cover the presented image, otherwise the screen-space
+    // AO does not align with the frame (e.g. a shadow-pass depth buffer
+    // was the last one bound). Skip such frames with a log trace.
+    if (uint32_t(depthImg->info().extent.width) != width
+     || uint32_t(depthImg->info().extent.height) != height) {
+      if (doLog) CacaoLogger::get().log(str::format(
+        "[FRAME] TryApply: skip (depth ", depthImg->info().extent.width, "x",
+        depthImg->info().extent.height, " != swap ", width, "x", height, ")"));
+      m_cacao.FillAoBuffer(this, 1.0f);
+      return;
+    }
+
     // If MSAA depth — resolve into single-sample via DXVK public API.
     // EmitCs here is safe: Flush() was already called before TryApplyCACAO,
     // so the render pass is closed and depth is fully written.
@@ -9621,7 +9633,8 @@ namespace dxvk {
     // We use the cached matrix because currentProj may be identity at Present time
     if (doLog) CacaoLogger::get().log(str::format(
       "[FRAME] TryApply: RUNNING frame=", s_frameCount,
-      " depthFmt=", (int)depthImg->info().format));
+      " depthFmt=", (int)depthImg->info().format,
+      " depth=", depthImg->info().extent.width, "x", depthImg->info().extent.height));
 
     m_cacao.Apply(this, depthImg, reinterpret_cast<const float*>(&m_cacaoLastProj), width, height,
                   GetOptions()->cacaoDebugFill);

@@ -33,6 +33,7 @@ uniform present_info_t {
   ivec2 cursor_extent;
   uint sampler_gamma;
   uint sampler_cursor;
+  float ao_dark_mask;
 };
 
 
@@ -54,8 +55,14 @@ vec4 composite_image(vec4 color) {
     float ao = texelFetch(s_ao, coord, 0).r;
     if (c_ao_debug_view)
       color.rgb = vec3(ao);  // show raw AO greyscale, skip HUD/cursor
-    else
-      color.rgb *= ao;  // CACAO writes visibility: 1.0 = fully lit, 0.0 = fully occluded
+    else {
+      // Baked-lighting compensation (UE2 lightmaps already contain AO):
+      // scale down the AO effect where the scene is already dark so that
+      // baked shadow areas are not darkened twice. Full effect on lit pixels.
+      float lum  = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float mask = 1.0 - ao_dark_mask * (1.0 - min(lum * 3.0, 1.0));
+      color.rgb *= mix(1.0, ao, mask);  // CACAO writes visibility: 1.0 = lit, 0.0 = occluded
+    }
   }
 
   if (c_composite_hud)
