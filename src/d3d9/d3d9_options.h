@@ -172,6 +172,16 @@ namespace dxvk {
 
     /// Add an extra front buffer to make GetFrontBufferData() work correctly when the swapchain only has a single buffer
     bool extraFrontbuffer;
+
+    /// CACAO ambient occlusion settings
+    bool    cacaoEnable;       ///< Enable CACAO post-process (default: true)
+    int32_t cacaoQuality;      ///< Quality: 0=Lowest, 1=Low, 2=Medium, 3=High (default: 2)
+    float   cacaoRadius;       ///< Effect radius in world units (default: 1.2)
+    float   cacaoStrength;     ///< Shadow strength scalar 0-2 (default: 1.0)
+    float   cacaoShadowClamp;  ///< Shadow clamp 0-1 (default: 0.98)
+    int32_t cacaoHotkey;       ///< VK_ keycode for toggle hotkey (default: VK_INSERT = 0x2D)
+    bool    cacaoDebugFill;    ///< Debug: fill AO with 0.5 (tests composite path, default: false)
+    bool    cacaoDebugView;    ///< Debug: show raw AO buffer as greyscale overlay (default: false)
   };
 
 }

@@ -240,6 +240,13 @@ namespace dxvk {
   }
 
 
+  void DxvkSwapchainBlitter::setAoView(Rc<DxvkImageView> view, bool debugView) {
+    std::unique_lock lock(m_mutex);
+    m_aoView      = std::move(view);
+    m_aoDebugView = debugView;
+  }
+
+
   void DxvkSwapchainBlitter::performDraw(
     const Rc<DxvkCommandList>&ctx,
     const Rc<DxvkImageView>&  dstView,
@@ -298,11 +305,13 @@ namespace dxvk {
     key.needsBlit = dstRect.extent != srcRect.extent;
     key.compositeHud = composite && m_hudSrv;
     key.compositeCursor = composite && m_cursorView;
+    key.compositeAo  = m_aoView != nullptr;
+    key.aoDebugView  = m_aoView != nullptr && m_aoDebugView;
 
     VkPipeline pipeline = getBlitPipeline(key);
 
     // Set up resource bindings
-    std::array<DxvkDescriptorWrite, 4> descriptors = { };
+    std::array<DxvkDescriptorWrite, 5> descriptors = { };
 
     auto& imageDescriptor = descriptors[0u];
     imageDescriptor.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -322,6 +331,12 @@ namespace dxvk {
 
     auto& cursorDescriptor = descriptors[3u];
     cursorDescriptor.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+
+    auto& aoDescriptor = descriptors[4u];
+    aoDescriptor.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+
+    if (m_aoView)
+      aoDescriptor.descriptor = m_aoView->getDescriptor();
 
     uint32_t cursorSampler = m_samplerCursorNearest->getDescriptor().samplerIndex;
 
@@ -368,6 +383,9 @@ namespace dxvk {
 
     if (m_cursorImage)
       ctx->track(m_cursorImage, DxvkAccess::Read);
+
+    if (m_aoView)
+      ctx->track(m_aoView->image(), DxvkAccess::Read);
 
     ctx->track(m_samplerGamma);
     ctx->track(m_samplerCursorLinear);
@@ -688,7 +706,8 @@ namespace dxvk {
 
 
   const DxvkPipelineLayout* DxvkSwapchainBlitter::createBlitPipelineLayout() {
-    static const std::array<DxvkDescriptorSetLayoutBinding, 4> bindings = {{
+    static const std::array<DxvkDescriptorSetLayoutBinding, 5> bindings = {{
+      { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
       { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
       { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
       { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
@@ -715,7 +734,7 @@ namespace dxvk {
     const DxvkSwapchainPipelineKey&   key) {
     auto vk = m_device->vkd();
 
-    static const std::array<VkSpecializationMapEntry, 8> specMap = {{
+static const std::array<VkSpecializationMapEntry, 10> specMap = {{
       { 0, offsetof(SpecConstants, sampleCount),    sizeof(VkSampleCountFlagBits) },
       { 1, offsetof(SpecConstants, gammaBound),     sizeof(VkBool32) },
       { 2, offsetof(SpecConstants, srcSpace),       sizeof(VkColorSpaceKHR) },
@@ -724,6 +743,8 @@ namespace dxvk {
       { 5, offsetof(SpecConstants, dstIsSrgb),      sizeof(VkBool32) },
       { 6, offsetof(SpecConstants, compositeHud),   sizeof(VkBool32) },
       { 7, offsetof(SpecConstants, compositeCursor),sizeof(VkBool32) },
+      { 8, offsetof(SpecConstants, compositeAo),    sizeof(VkBool32) },
+      { 9, offsetof(SpecConstants, aoDebugView),     sizeof(VkBool32) },
     }};
 
     SpecConstants specConstants = { };
@@ -735,6 +756,8 @@ namespace dxvk {
     specConstants.dstIsSrgb = lookupFormatInfo(key.dstFormat)->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
     specConstants.compositeCursor = key.compositeCursor;
     specConstants.compositeHud = key.compositeHud;
+    specConstants.compositeAo = key.compositeAo;
+    specConstants.aoDebugView = key.aoDebugView;
 
     // Avoid redundant color space conversions if color spaces
     // and images properties match and we don't do a resolve

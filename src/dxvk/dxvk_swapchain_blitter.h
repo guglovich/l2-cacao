@@ -49,6 +49,10 @@ namespace dxvk {
     VkBool32 compositeHud = VK_FALSE;
     /// Bit indicating whether the software cursor needs to be composited
     VkBool32 compositeCursor = VK_FALSE;
+    /// Bit indicating whether the CACAO ambient occlusion result needs to be composited
+    VkBool32 compositeAo = VK_FALSE;
+    /// Show raw AO buffer as greyscale (debug)
+    VkBool32 aoDebugView = VK_FALSE;
 
     size_t hash() const {
       DxvkHashState hash;
@@ -61,6 +65,8 @@ namespace dxvk {
       hash.add(uint32_t(needsGamma));
       hash.add(uint32_t(compositeHud));
       hash.add(uint32_t(compositeCursor));
+      hash.add(uint32_t(compositeAo));
+      hash.add(uint32_t(aoDebugView));
       return hash;
     }
 
@@ -73,7 +79,9 @@ namespace dxvk {
           && needsBlit == other.needsBlit
           && needsGamma == other.needsGamma
           && compositeHud == other.compositeHud
-          && compositeCursor == other.compositeCursor;
+          && compositeCursor == other.compositeCursor
+          && compositeAo == other.compositeAo
+          && aoDebugView == other.aoDebugView;
     }
   };
 
@@ -174,6 +182,15 @@ namespace dxvk {
     void setCursorPos(
             VkRect2D            rect);
 
+    /**
+     * \brief Sets ambient occlusion view for compositing
+     *
+     * If non-null, the AO texture will be blended into
+     * the scene during the present blit (color.rgb *= ao).
+     * \param [in] view CACAO AO image view (R channel = AO)
+     */
+    void setAoView(Rc<DxvkImageView> view, bool debugView = false);
+
   private:
 
     struct SpecConstants {
@@ -185,6 +202,8 @@ namespace dxvk {
       VkBool32 dstIsSrgb;
       VkBool32 compositeHud;
       VkBool32 compositeCursor;
+      VkBool32 compositeAo;
+      VkBool32 aoDebugView;
     };
 
     struct PushConstants {
@@ -230,6 +249,9 @@ namespace dxvk {
     Rc<DxvkImage>       m_hudImage;
     Rc<DxvkImageView>   m_hudRtv;
     Rc<DxvkImageView>   m_hudSrv;
+
+    Rc<DxvkImageView>   m_aoView;
+    bool                m_aoDebugView = false;
 
     const DxvkPipelineLayout* m_blitLayout = nullptr;
     const DxvkPipelineLayout* m_cursorLayout = nullptr;

@@ -36,6 +36,8 @@
 #include "../util/util_lru.h"
 #include "../util/util_unmap.h"
 
+#include "d3d9_cacao.h"
+
 namespace dxvk {
 
   class D3D9InterfaceEx;
@@ -230,6 +232,7 @@ namespace dxvk {
     friend D3D9VkInteropDevice;
 
     using CbvIndex = D3D9ShaderResourceMapping::CbvIndex;
+    friend class D3D9CacaoRenderer;
   public:
 
     D3D9DeviceEx(
@@ -812,6 +815,15 @@ namespace dxvk {
     const Rc<DxvkDevice>& GetDXVKDevice() {
       return m_dxvkDevice;
     }
+
+    void TryApplyCACAO(uint32_t width, uint32_t height);
+    void TryExtractProjectionFromVSConstants(UINT StartRegister, const float* pConstantData, UINT Vector4fCount);
+    void TryExtractProjectionFromAllConstants();
+    void BuildUE2ProjectionMatrix(Matrix4& out, uint32_t width, uint32_t height);
+    Rc<DxvkImageView> GetCacaoAoView() {
+      return (m_cacao.IsEnabled() && m_cacao.IsInitialized()) ? m_cacao.GetAoView() : nullptr;
+    }
+    void ToggleCACAO();
 
     D3D9_VK_FORMAT_MAPPING LookupFormat(
       D3D9Format            Format) const;
@@ -1578,6 +1590,19 @@ namespace dxvk {
 
     D3D9Initializer*                m_initializer = nullptr;
     D3D9FormatHelper*               m_converter   = nullptr;
+    D3D9CacaoRenderer               m_cacao;
+    int32_t                         m_cacaoHotkey      = 0;
+    bool                            m_prevHotkeyState  = false;
+    Rc<DxvkImage>                   m_cacaoLastDepthImg;
+    // Single-sample resolve target for MSAA depth buffers.
+    // Recreated whenever the depth image dimensions/format change.
+    Rc<DxvkImage>                   m_cacaoDepthResolved;
+    // Last projection matrix seen during a real 3D draw (depth buffer active).
+    // UE2 stores projection matrix in vertex shader constants, not SetTransform.
+    Matrix4                         m_cacaoLastProj    = {};
+    bool                            m_cacaoHasValidProj = false;
+    uint32_t                        m_cacaoLastWidth   = 0;     // For UE2 fallback projection
+    uint32_t                        m_cacaoLastHeight  = 0;
 
     D3D9FFShaderModuleSet           m_ffModules;
     D3D9SWVPEmulator                m_swvpEmulator;

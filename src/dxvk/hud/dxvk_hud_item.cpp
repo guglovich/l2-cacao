@@ -1,4 +1,5 @@
 #include "dxvk_hud_item.h"
+#include "dxvk_hud_cacao.h"
 
 #include <hud_chunk_frag_background.h>
 #include <hud_chunk_frag_visualize.h>
@@ -1460,6 +1461,50 @@ namespace dxvk::hud {
     renderer.drawText(16, position, 0xffff60a0u, "Sleep: ");
     renderer.drawText(16, { position.x + 108, position.y }, 0xffffffffu, m_sleepString);
 
+    position.y += 8;
+    return position;
+  }
+
+
+  // ── CACAO globals ─────────────────────────────────────────────────────────
+
+  std::atomic<bool> g_cacaoActive{false};
+  std::atomic<bool> g_cacaoEnabled{false};
+  std::atomic<int>  g_cacaoQuality{2};
+
+
+  // ── HudCacaoItem ──────────────────────────────────────────────────────────
+
+  HudPos HudCacaoItem::render(
+    const Rc<DxvkCommandList>&,
+    const HudPipelineKey&,
+    const HudOptions&,
+          HudRenderer&   renderer,
+          HudPos         position) {
+    static const char* qNames[] = { "Lowest", "Low", "Medium", "High" };
+
+    bool ac = g_cacaoActive.load();
+    bool en = g_cacaoEnabled.load();
+    int  q  = g_cacaoQuality.load();
+    if (q < 0) q = 0;
+    if (q > 3) q = 3;
+
+    std::string text;
+    uint32_t color;
+
+    if (!ac) {
+      text  = "CACAO: N/A";
+      color = 0xff808080u;  // grey — renderer not running
+    } else if (en) {
+      text  = str::format("CACAO: ON  [", qNames[q], "]");
+      color = 0xff40ff40u;  // green — enabled
+    } else {
+      text  = "CACAO: OFF";
+      color = 0xffff4040u;  // red — disabled
+    }
+
+    position.y += 16;
+    renderer.drawText(16, position, color, text);
     position.y += 8;
     return position;
   }

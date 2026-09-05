@@ -446,7 +446,9 @@ namespace dxvk {
     const bool isDS = m_desc.Usage & D3DUSAGE_DEPTHSTENCIL;
     const bool isAutoGen = m_desc.Usage & D3DUSAGE_AUTOGENMIPMAP;
 
-    if (!m_desc.IsAttachmentOnly || (!isRT && !isDS))
+    // Always add SAMPLED_BIT for depth-stencil surfaces so CACAO can
+    // sample the depth buffer. For colour attachments, respect IsAttachmentOnly.
+    if (!m_desc.IsAttachmentOnly || (!isRT && !isDS) || isDS)
       imageInfo.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
 
     // Are we an RT, need to gen mips or an offscreen plain surface?

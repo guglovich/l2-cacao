@@ -123,6 +123,37 @@ namespace dxvk {
     Rc<DxvkCommandList> beginExternalRendering();
 
     /**
+     * \brief Fully ends any active or suspended render pass
+     *
+     * Call this before beginExternalRendering() when the external pass
+     * needs to access render target images (e.g. depth buffer). Without
+     * this, endCurrentCommands() only suspends the render pass, leaving
+     * GpRenderPassSuspended set, which causes incorrect barriers on resume.
+     */
+    void endRenderPassForExternal();
+
+    /**
+     * \brief Returns current command list for inline compute injection
+     *
+     * Unlike beginExternalRendering(), this does NOT split the command
+     * buffer — it only ends any active render pass (suspend=false) so
+     * the caller can safely record compute commands into the same
+     * command list without breaking the graphics pipeline state.
+     * The caller must restore any image layouts it changes.
+     */
+    Rc<DxvkCommandList> getCommandListForCompute();
+
+    /**
+     * \brief Notifies context that an external pass changed depth image layout
+     *
+     * Call this after beginExternalRendering() + raw Vulkan barriers that
+     * transition the depth attachment to a new layout and back. Keeps
+     * m_rtLayouts.depth in sync so DXVK emits correct barriers on next draw.
+     * \param [in] layout The layout the depth image is in NOW (after external work)
+     */
+    void notifyExternalDepthLayout(VkImageLayout layout);
+
+    /**
      * \brief Begins generating query data
      * \param [in] query The query to end
      */
@@ -1751,7 +1782,7 @@ namespace dxvk {
     DxvkFramebufferInfo makeFramebufferInfo(
       const DxvkRenderTargets&      renderTargets);
 
-    void updateRenderTargets();
+    void updateRenderTargets(bool isDraw = false);
     
     bool flushDeferredClear(
       const DxvkImage&              image,
