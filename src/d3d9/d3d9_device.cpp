@@ -4714,13 +4714,29 @@ namespace dxvk {
       // Cache the latest PERSPECTIVE matrix for CACAO.
       // Perspective has proj[3][2] = -near*far/(far-near) != 0;
       // ortho (UI) matrices and identity have proj[3][2] == 0 → rejected.
-      if (m[3][2] != 0.0f) {
-        bool changed = std::memcmp(&m_cacaoLastProj, &m, sizeof(Matrix4)) != 0;
-        if (!m_cacaoHasValidProj || changed) {
-          m_cacaoLastProj    = m;
-          m_cacaoHasValidProj = true;
+      // Additionally the matrix aspect (proj[1][1]/proj[0][0]) must match the
+      // back buffer aspect: UE2 renders water/reflection passes with square
+      // projections into offscreen targets, and using such a matrix for the
+      // main scene depth unprojection corrupts the AO every frame (flicker).
+      if (m[3][2] != 0.0f && !m_cacaoProjFromVS) {
+        bool aspectOk = true;
+        if (m_cacaoLastWidth > 0 && m_cacaoLastHeight > 0 && m[0][0] != 0.0f) {
+          float matAspect  = m[1][1] / m[0][0];
+          float backAspect = float(m_cacaoLastHeight) / float(m_cacaoLastWidth);
+          aspectOk = std::abs(matAspect - backAspect) < 0.15f * backAspect;
+        }
+        if (aspectOk) {
+          bool changed = std::memcmp(&m_cacaoLastProj, &m, sizeof(Matrix4)) != 0;
+          if (!m_cacaoHasValidProj || changed) {
+            m_cacaoLastProj    = m;
+            m_cacaoHasValidProj = true;
+            CacaoLogger::get().log(str::format(
+              "[PROJ-CACHE] Cached projection matrix from SetTransform: [",
+              m[0][0], ", ", m[1][1], ", ", m[2][2], ", ", m[3][2], "]"));
+          }
+        } else {
           CacaoLogger::get().log(str::format(
-            "[PROJ-CACHE] Cached projection matrix from SetTransform: [",
+            "[PROJ-CACHE] Rejected off-aspect projection (water/reflection?): [",
             m[0][0], ", ", m[1][1], ", ", m[2][2], ", ", m[3][2], "]"));
         }
       }
@@ -9416,18 +9432,19 @@ namespace dxvk {
       const float* r2 = &pConstantData[(base + 2 - StartRegister) * 4];
       const float* r3 = &pConstantData[(base + 3 - StartRegister) * 4];
 
-      // D3D9 projection matrix pattern check:
-      // Row 0: (x, 0, 0, 0) or (x, 0, 0, 1) - only element [0] is significant
-      // Row 1: (0, y, 0, 0) or (0, y, 0, 1) - only element [1] is significant
-      // Row 2: (0, 0, z, w) - elements [2] and [3] are significant
-      // Row 3: (0, 0, 1, 0) or (0, 0, -1, 0) - element [2] = ±1, [3] = 0
-
-      bool row0_ok = std::abs(r0[1]) < 0.001f && std::abs(r0[2]) < 0.001f && std::abs(r0[0]) > 0.1f;
-      bool row1_ok = std::abs(r1[0]) < 0.001f && std::abs(r1[2]) < 0.001f && std::abs(r1[1]) > 0.1f;
-      bool row2_ok = std::abs(r2[0]) < 0.001f && std::abs(r2[1]) < 0.001f && std::abs(r2[2]) > 0.1f;
+      // D3D9 row-major perspective matrix layout:
+      //   row0: (x, 0, 0, 0)                    x = cot(fovX/2) [or /aspect]
+      //   row1: (0, y, 0, 0)                    y = cot(fovY/2)
+      //   row2: (0, 0, c, 1)                    c = far/(far-near)   [_34 = 1]
+      //   row3: (0, 0, d, 0)                    d = -near*far/(far-near) ≠ 0
+      bool row0_ok = std::abs(r0[1]) < 0.001f && std::abs(r0[2]) < 0.001f
+                    && std::abs(r0[3]) < 0.001f && std::abs(r0[0]) > 0.05f;
+      bool row1_ok = std::abs(r1[0]) < 0.001f && std::abs(r1[2]) < 0.001f
+                    && std::abs(r1[3]) < 0.001f && std::abs(r1[1]) > 0.05f;
+      bool row2_ok = std::abs(r2[0]) < 0.001f && std::abs(r2[1]) < 0.001f
+                    && std::abs(r2[3] - 1.0f) < 0.01f && std::abs(r2[2]) > 0.1f;
       bool row3_ok = std::abs(r3[0]) < 0.001f && std::abs(r3[1]) < 0.001f
-                    && (std::abs(r3[2] - 1.0f) < 0.01f || std::abs(r3[2] + 1.0f) < 0.01f)
-                    && std::abs(r3[3]) < 0.001f;
+                    && std::abs(r3[3]) < 0.001f && std::abs(r3[2]) > 0.05f;
 
       if (row0_ok && row1_ok && row2_ok && row3_ok) {
         // Found projection matrix! Store it
@@ -9440,6 +9457,7 @@ namespace dxvk {
         m_cacaoLastProj[3][0] = r3[0]; m_cacaoLastProj[3][1] = r3[1];
         m_cacaoLastProj[3][2] = r3[2]; m_cacaoLastProj[3][3] = r3[3];
         m_cacaoHasValidProj = true;
+        m_cacaoProjFromVS  = true;
         CacaoLogger::get().log(str::format(
           "[VS-CONST] Found projection matrix at c", base,
           ": proj[0][0]=", r0[0], " proj[1][1]=", r1[1],
