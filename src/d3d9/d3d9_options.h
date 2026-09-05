@@ -180,6 +180,7 @@ namespace dxvk {
     float   cacaoStrength;     ///< Shadow strength scalar 0-2 (default: 1.0)
     float   cacaoShadowClamp;  ///< Shadow clamp 0-1 (default: 0.98)
     int32_t cacaoHotkey;       ///< VK_ keycode for toggle hotkey (default: VK_INSERT = 0x2D)
+    float   cacaoDarkMask;     ///< Baked-lighting compensation: suppress AO on already-dark pixels (0.0-1.0, default: 0.7)
     bool    cacaoDebugFill;    ///< Debug: fill AO with 0.5 (tests composite path, default: false)
     bool    cacaoDebugView;    ///< Debug: show raw AO buffer as greyscale overlay (default: false)
   };

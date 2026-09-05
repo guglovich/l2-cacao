@@ -135,10 +135,12 @@ namespace dxvk {
     this->cacaoShadowClamp = config.getOption<float>      ("d3d9.cacaoShadowClamp", 0.98f);
     this->cacaoHotkey      = parseCacaoHotkey(
       config.getOption<std::string>("d3d9.cacaoHotkey", "Insert"));
+    this->cacaoDarkMask    = config.getOption<float>      ("d3d9.cacaoDarkMask",   0.7f);
     this->cacaoDebugFill   = config.getOption<bool>       ("d3d9.cacaoDebugFill",  false);
     this->cacaoDebugView   = config.getOption<bool>       ("d3d9.cacaoDebugView",  false);
 
-    this->cacaoQuality = dxvk::clamp(this->cacaoQuality, (int32_t)0, (int32_t)3);
+    this->cacaoQuality  = dxvk::clamp(this->cacaoQuality, (int32_t)0, (int32_t)3);
+    this->cacaoDarkMask = dxvk::clamp(this->cacaoDarkMask, 0.0f, 1.0f);
   }
 
 }
