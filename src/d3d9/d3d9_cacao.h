@@ -164,7 +164,11 @@ namespace dxvk {
     // ── Descriptor pool and pre-allocated sets ────────────────────────────
     // Double-buffered: 2 frames × kSetsPerFrame sets = kTotalSets sets.
     // Alternating each frame avoids updating sets while GPU executes them.
-    static constexpr uint32_t kFrameLag    = 2u;
+    // 4 = swapchain image count: descriptor sets and AO buffers are updated
+    // on the host at record time; a larger lag guarantees the GPU has finished
+    // using slot N-kTotalSets before it is reused, preventing flicker under
+    // heavy scenes where the CS queue runs multiple frames behind.
+    static constexpr uint32_t kFrameLag    = 4u;
     static constexpr uint32_t kSetsPerFrame = 8u;  // DEPTHS, NORMALS, Q3, BLUR×4, APPLY
     static constexpr uint32_t kTotalSets   = kFrameLag * kSetsPerFrame;
 
