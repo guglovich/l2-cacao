@@ -456,19 +456,23 @@ void D3D9CacaoRenderer::InitResources(uint32_t w, uint32_t h) {
 
   m_deinterleavedDepths = CreateIntermediateImage(hw, hh,
     VK_FORMAT_R32_SFLOAT, 4, 4,
-    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+    | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
   m_deinterleavedNormals = CreateIntermediateImage(hw, hh,
     VK_FORMAT_R32G32B32A32_SFLOAT, 4, 1,
-    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+    | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
   m_ssaoPing = CreateIntermediateImage(hw, hh,
     VK_FORMAT_R32G32_SFLOAT, 4, 1,
-    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+    | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
   m_ssaoPong = CreateIntermediateImage(hw, hh,
     VK_FORMAT_R32G32_SFLOAT, 4, 1,
-    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+    | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
   m_importanceMap = CreateIntermediateImage(qw, qh,
     VK_FORMAT_R32_SFLOAT, 1, 1,
@@ -483,7 +487,8 @@ void D3D9CacaoRenderer::InitResources(uint32_t w, uint32_t h) {
   for (uint32_t i = 0; i < kFrameLag; i++) {
     m_aoFinals[i] = CreateIntermediateImage(w, h,
       VK_FORMAT_R16G16B16A16_SFLOAT, 1, 1,
-      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+      | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
   }
 
   // Persistent SAMPLED_IMAGE views of m_aoFinals for use in the present blitter
@@ -535,9 +540,9 @@ void D3D9CacaoRenderer::InitResources(uint32_t w, uint32_t h) {
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
   }
 
-  // Readback buffer: 8 bytes = one RGBA16F pixel (4 × float16 = 8 bytes)
+  // Readback buffer: 1024 bytes = 4 B depth + 8 B ssao @16 + 512 B ao strip @64
   DxvkBufferCreateInfo rbci = {};
-  rbci.size   = 8u;
+  rbci.size   = 1024u;
   rbci.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   rbci.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
   rbci.access = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -782,11 +787,11 @@ void D3D9CacaoRenderer::Apply(
   if (!depthImage)
     return;
 
-  // ── CPU readback: log AO pixel value from previous frame's GPU copy ────
+  // ── CPU readback: multi-stage probe from previous frame's GPU copy ──────
   if (m_readbackPending && m_readbackBuffer) {
     m_readbackPending = false;
-    // RGBA16F: 4 × uint16_t; R channel = AO value
-    const uint16_t* px = reinterpret_cast<const uint16_t*>(m_readbackBuffer->mapPtr(0));
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(m_readbackBuffer->mapPtr(0));
+
     // Convert float16 to float32 manually (simple half-to-float)
     auto half2float = [](uint16_t h) -> float {
       uint32_t sign     = (h >> 15) & 0x1;
@@ -798,13 +803,24 @@ void D3D9CacaoRenderer::Apply(
       else                     f = (sign << 31) | ((exponent + 112) << 23) | (mantissa << 13);
       float result; std::memcpy(&result, &f, 4); return result;
     };
-    float r = half2float(px[0]);
-    float g = half2float(px[1]);
-    float b = half2float(px[2]);
-    float a = half2float(px[3]);
+
+    float viewDepth = 0.0f, ssaoR = 0.0f, ssaoG = 0.0f;
+    std::memcpy(&viewDepth, base + 0, 4);
+    std::memcpy(&ssaoR,     base + 16, 4);
+    std::memcpy(&ssaoG,     base + 20, 4);
+
+    const uint16_t* strip = reinterpret_cast<const uint16_t*>(base + 64);
+    float aoMin = 1e9f, aoMax = -1e9f;
+    for (uint32_t i = 0; i < 64; i++) {
+      float ao = half2float(strip[i * 4 + 0]);
+      aoMin = std::min(aoMin, ao);
+      aoMax = std::max(aoMax, ao);
+    }
     CacaoLogger::get().log(str::format(
-      "[READBACK] aoFinal center pixel: R=", r, " G=", g, " B=", b, " A=", a,
-      " (AO=R, expect 0.0..1.0; 1.0=no occlusion, 0.0=full shadow)"));
+      "[READBACK] viewZ=", viewDepth, " ssao=(", ssaoR, ", ", ssaoG, ")",
+      " aoStrip[min=", aoMin, " max=", aoMax, "]",
+      " first4=", half2float(strip[0]), ",", half2float(strip[4]), ",",
+      half2float(strip[8]), ",", half2float(strip[12])));
   }
 
   // Log first successful Apply call with diagnostic info
@@ -1310,38 +1326,68 @@ void D3D9CacaoRenderer::Apply(
 
     // ── No depth layout restore needed (we read from GENERAL, no transition was made) ──
 
-    // ── CPU readback: copy center pixel of aoFinal to host-visible buffer ───
+    // ── CPU readback: multi-stage probe ────────────────────────────────────
+    // Buffer layout: [0..3]   deintD  layer0 mip0 center pixel (R32F, viewZ)
+    //                [16..23] ssao    layer0 center pixel (R32G32F, blurred AO)
+    //                [64..575] aoFinal center strip 64x1 (RGBA16F, 8 B/px)
     if (readbackBuf) {
-      // Barrier: fragment-read → transfer-read
-      VkImageMemoryBarrier2 rb = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-      rb.srcStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-      rb.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-      rb.dstStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
-      rb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-      rb.oldLayout = rb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-      rb.srcQueueFamilyIndex = rb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      rb.image = aoFinal->handle();
-      rb.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-      VkDependencyInfo rdi = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-      rdi.imageMemoryBarrierCount = 1;
-      rdi.pImageMemoryBarriers    = &rb;
-      cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &rdi);
+      Rc<DxvkImage> finalSsao = (numBlurPasses % 2 == 0) ? ssaoPong : ssaoPing;
 
-      // Copy 1 pixel from center of aoFinal
-      VkBufferImageCopy2 region = { VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2 };
-      region.bufferOffset      = readbackBuf->getSliceInfo().offset;
-      region.bufferRowLength   = 0;
-      region.bufferImageHeight = 0;
-      region.imageSubresource  = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-      region.imageOffset       = { int32_t(w / 2), int32_t(h / 2), 0 };
-      region.imageExtent       = { 1, 1, 1 };
-      VkCopyImageToBufferInfo2 copyInfo = { VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2 };
-      copyInfo.srcImage       = aoFinal->handle();
-      copyInfo.srcImageLayout = VK_IMAGE_LAYOUT_GENERAL;
-      copyInfo.dstBuffer      = readbackBuf->getSliceInfo().buffer;
-      copyInfo.regionCount    = 1;
-      copyInfo.pRegions       = &region;
-      cmd->cmdCopyImageToBuffer(DxvkCmdBuffer::ExecBuffer, &copyInfo);
+      auto transferReadBarrier = [&](const Rc<DxvkImage>& img) {
+        VkImageMemoryBarrier2 rb = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        rb.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                         | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        rb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+                         | VK_ACCESS_2_SHADER_READ_BIT;
+        rb.dstStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
+        rb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        rb.oldLayout = rb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        rb.srcQueueFamilyIndex = rb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        rb.image = img->handle();
+        rb.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VkDependencyInfo rdi = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        rdi.imageMemoryBarrierCount = 1;
+        rdi.pImageMemoryBarriers    = &rb;
+        cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &rdi);
+      };
+
+      transferReadBarrier(deintD);
+      transferReadBarrier(finalSsao);
+      transferReadBarrier(aoFinal);
+
+      VkDeviceSize bufBase = readbackBuf->getSliceInfo().offset;
+      VkBuffer dstBuf      = readbackBuf->getSliceInfo().buffer;
+
+      auto copyRegion = [&](VkDeviceSize offset, const Rc<DxvkImage>& img,
+                            VkImageAspectFlags aspect, int32_t x, int32_t y,
+                            uint32_t cw, uint32_t ch) {
+        VkBufferImageCopy2 region = { VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2 };
+        region.bufferOffset      = bufBase + offset;
+        region.bufferRowLength   = 0;
+        region.bufferImageHeight = 0;
+        region.imageSubresource  = { aspect, 0, 0, 1 };
+        region.imageOffset       = { x, y, 0 };
+        region.imageExtent       = { cw, ch, 1 };
+        VkCopyImageToBufferInfo2 copyInfo = { VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2 };
+        copyInfo.srcImage       = img->handle();
+        copyInfo.srcImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        copyInfo.dstBuffer      = dstBuf;
+        copyInfo.regionCount    = 1;
+        copyInfo.pRegions       = &region;
+        cmd->cmdCopyImageToBuffer(DxvkCmdBuffer::ExecBuffer, &copyInfo);
+      };
+
+      // 1) deinterleaved depth, layer 0, mip 0, center pixel
+      copyRegion(0,  deintD,     VK_IMAGE_ASPECT_COLOR_BIT,
+                 int32_t(bsiCopy.deinterleavedDepthBufferWidth  / 2),
+                 int32_t(bsiCopy.deinterleavedDepthBufferHeight / 2), 1, 1);
+      // 2) blurred SSAO (final half-res buffer), layer 0, center pixel
+      copyRegion(16, finalSsao,  VK_IMAGE_ASPECT_COLOR_BIT,
+                 int32_t(bsiCopy.ssaoBufferWidth  / 2),
+                 int32_t(bsiCopy.ssaoBufferHeight / 2), 1, 1);
+      // 3) aoFinal strip 64x1 from the vertical center
+      copyRegion(64, aoFinal,    VK_IMAGE_ASPECT_COLOR_BIT,
+                 int32_t(w / 2) - 32, int32_t(h / 2), 64, 1);
 
       cmd->track(readbackBuf, DxvkAccess::Write);
     }
