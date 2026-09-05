@@ -4735,9 +4735,17 @@ namespace dxvk {
               m[0][0], ", ", m[1][1], ", ", m[2][2], ", ", m[3][2], "]"));
           }
         } else {
-          CacaoLogger::get().log(str::format(
-            "[PROJ-CACHE] Rejected off-aspect projection (water/reflection?): [",
-            m[0][0], ", ", m[1][1], ", ", m[2][2], ", ", m[3][2], "]"));
+          // Log each distinct rejected matrix only once (water passes
+          // rebind the square projection thousands of times per second).
+          static Matrix4 s_lastRejected = {};
+          static bool    s_rejInit      = false;
+          if (!s_rejInit || std::memcmp(&s_lastRejected, &m, sizeof(Matrix4)) != 0) {
+            s_lastRejected = m;
+            s_rejInit      = true;
+            CacaoLogger::get().log(str::format(
+              "[PROJ-CACHE] Rejected off-aspect projection (water/reflection?): [",
+              m[0][0], ", ", m[1][1], ", ", m[2][2], ", ", m[3][2], "]"));
+          }
         }
       }
     }
