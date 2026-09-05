@@ -4700,21 +4700,28 @@ namespace dxvk {
     // so projection matrix is not available during draw calls)
     if (idx == GetTransformIndex(D3DTS_PROJECTION)) {
       const Matrix4& m = m_state.transforms[idx];
-      CacaoLogger::get().log(str::format(
-        "[SETTRANSFORM] D3DTS_PROJECTION: [",
-        m[0][0], ", ", m[1][1], ", ", m[2][2], ", ", m[3][2], "]"));
+      // Log only when the matrix actually changes (UE2 toggles it every frame)
+      static Matrix4 s_lastLogged = {};
+      static bool    s_loggedAny  = false;
+      if (!s_loggedAny || std::memcmp(&s_lastLogged, &m, sizeof(Matrix4)) != 0) {
+        s_lastLogged = m;
+        s_loggedAny  = true;
+        CacaoLogger::get().log(str::format(
+          "[SETTRANSFORM] D3DTS_PROJECTION: [",
+          m[0][0], ", ", m[1][1], ", ", m[2][2], ", ", m[3][2], "]"));
+      }
 
-      // Cache non-identity projection matrix for CACAO
-      // UE2 sets projection matrix once at init, not per-frame
-      if (!m_cacaoHasValidProj) {
-        if (m[0][0] != 1.0f || m[1][1] != 1.0f || m[3][2] != 0.0f) {
-          m_cacaoLastProj = m;
+      // Cache the latest PERSPECTIVE matrix for CACAO.
+      // Perspective has proj[3][2] = -near*far/(far-near) != 0;
+      // ortho (UI) matrices and identity have proj[3][2] == 0 → rejected.
+      if (m[3][2] != 0.0f) {
+        bool changed = std::memcmp(&m_cacaoLastProj, &m, sizeof(Matrix4)) != 0;
+        if (!m_cacaoHasValidProj || changed) {
+          m_cacaoLastProj    = m;
           m_cacaoHasValidProj = true;
           CacaoLogger::get().log(str::format(
             "[PROJ-CACHE] Cached projection matrix from SetTransform: [",
             m[0][0], ", ", m[1][1], ", ", m[2][2], ", ", m[3][2], "]"));
-        } else {
-          CacaoLogger::get().log("[PROJ] Identity matrix, skipping projection matrix cache");
         }
       }
     }

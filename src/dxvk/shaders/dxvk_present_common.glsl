@@ -55,7 +55,7 @@ vec4 composite_image(vec4 color) {
     if (c_ao_debug_view)
       color.rgb = vec3(ao);  // show raw AO greyscale, skip HUD/cursor
     else
-      color.rgb *= max(0.0, 1.0 - ao);  // CACAO writes raw occlusion; convert to occlusion factor
+      color.rgb *= ao;  // CACAO writes visibility: 1.0 = fully lit, 0.0 = fully occluded
   }
 
   if (c_composite_hud)
