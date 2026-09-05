@@ -189,7 +189,8 @@ namespace dxvk {
      * the scene during the present blit (color.rgb *= ao).
      * \param [in] view CACAO AO image view (R channel = AO)
      */
-    void setAoView(Rc<DxvkImageView> view, bool debugView = false, float darkMask = 0.0f);
+    void setAoView(Rc<DxvkImageView> view, bool debugView = false, float darkMask = 0.0f,
+                   float contactT0 = 0.0f, float contactT1 = 0.0f, float contactStrength = 0.0f);
 
   private:
 
@@ -215,6 +216,9 @@ namespace dxvk {
       uint32_t   samplerGamma;
       uint32_t   samplerCursor;
       float      aoDarkMask;
+      float      aoContactT0;
+      float      aoContactT1;
+      float      aoContactStrength;
     };
 
     struct CursorSpecConstants {
@@ -254,6 +258,9 @@ namespace dxvk {
     Rc<DxvkImageView>   m_aoView;
     bool                m_aoDebugView = false;
     float               m_aoDarkMask  = 0.0f;
+    float               m_aoContactT0 = 0.0f;
+    float               m_aoContactT1 = 0.0f;
+    float               m_aoContactStrength = 0.0f;
 
     const DxvkPipelineLayout* m_blitLayout = nullptr;
     const DxvkPipelineLayout* m_cursorLayout = nullptr;

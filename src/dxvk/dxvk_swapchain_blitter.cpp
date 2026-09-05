@@ -240,11 +240,15 @@ namespace dxvk {
   }
 
 
-  void DxvkSwapchainBlitter::setAoView(Rc<DxvkImageView> view, bool debugView, float darkMask) {
+  void DxvkSwapchainBlitter::setAoView(Rc<DxvkImageView> view, bool debugView, float darkMask,
+                                       float contactT0, float contactT1, float contactStrength) {
     std::unique_lock lock(m_mutex);
     m_aoView      = std::move(view);
     m_aoDebugView = debugView;
     m_aoDarkMask  = darkMask;
+    m_aoContactT0 = contactT0;
+    m_aoContactT1 = contactT1;
+    m_aoContactStrength = contactStrength;
   }
 
 
@@ -360,6 +364,9 @@ namespace dxvk {
     args.samplerGamma = m_samplerGamma->getDescriptor().samplerIndex;
     args.samplerCursor = cursorSampler;
     args.aoDarkMask = m_aoDarkMask;
+    args.aoContactT0 = m_aoContactT0;
+    args.aoContactT1 = m_aoContactT1;
+    args.aoContactStrength = m_aoContactStrength;
 
     ctx->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
       VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
