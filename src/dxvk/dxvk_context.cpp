@@ -209,7 +209,35 @@ namespace dxvk {
     return m_cmd;
   }
 
-  
+
+  void DxvkContext::endRenderPassForExternal() {
+    // Fully end any active or suspended render pass so that
+    // GpRenderPassSuspended is cleared before external Vulkan work.
+    // This prevents incorrect barrier generation when the render pass resumes.
+    endCurrentPass(false);
+  }
+
+
+  Rc<DxvkCommandList> DxvkContext::getCommandListForCompute() {
+    // End render pass fully (not suspend) so depth/color images are
+    // in their default layouts and GpRenderPassSuspended is cleared.
+    // We do NOT call endCurrentCommands/beginCurrentCommands — that
+    // would split the command buffer and dirty all pipeline state,
+    // causing UI flickering on the next frame.
+    endCurrentPass(false);
+    flushBarriers();
+    return m_cmd;
+  }
+
+
+  void DxvkContext::notifyExternalDepthLayout(VkImageLayout layout) {
+    // DXVK 3.x tracks image layouts per-image (DxvkImage::trackLayout) and
+    // with VK_KHR_unified_image_layouts all images live in GENERAL anyway.
+    // External passes must not change layouts; this is kept as a no-op for
+    // API compatibility with the CACAO renderer.
+  }
+
+
   void DxvkContext::beginQuery(const Rc<DxvkQuery>& query) {
     m_queryManager.enableQuery(m_cmd, query);
   }
@@ -7635,7 +7663,7 @@ namespace dxvk {
   }
 
 
-  void DxvkContext::updateRenderTargets() {
+  void DxvkContext::updateRenderTargets(bool isDraw) {
     if (m_flags.test(DxvkContextFlag::GpDirtyRenderTargets)) {
       m_flags.clr(DxvkContextFlag::GpDirtyRenderTargets);
 
@@ -7679,7 +7707,6 @@ namespace dxvk {
       this->endCurrentPass(true);
     }
   }
-
 
   bool DxvkContext::flushDeferredClear(
     const DxvkImage&              image,
@@ -8290,7 +8317,7 @@ namespace dxvk {
     // End render pass if there are pending resolves
     if (m_flags.any(DxvkContextFlag::GpDirtyRenderTargets,
                     DxvkContextFlag::GpRenderPassNeedsFlush))
-      this->updateRenderTargets();
+      this->updateRenderTargets(true);
 
     if (m_flags.test(DxvkContextFlag::GpXfbActive)) {
       // If transform feedback is active and there is a chance that we might

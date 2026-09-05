@@ -737,6 +737,23 @@ namespace dxvk::hud {
 
 
   /**
+   * \brief HUD item to display CACAO SSAO status
+   */
+  class HudCacaoItem : public HudItem {
+
+  public:
+
+    HudPos render(
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
+
+  };
+
+
+  /**
    * \brief Frame latency item
    */
   class HudLatencyItem : public HudItem {

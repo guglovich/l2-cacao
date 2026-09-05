@@ -848,6 +848,25 @@ namespace dxvk {
     Rc<DxvkImage> swapImage = m_backBuffers[0]->GetCommonTexture()->GetImage();
     Rc<DxvkImageView> swapImageView = m_backBuffers[0]->GetCommonTexture()->GetSampleView(false);
 
+    // CACAO hotkey: toggle AO on rising edge of configured key
+    {
+      int32_t hotkey = m_parent->GetOptions()->cacaoHotkey;
+#ifdef _WIN32
+      bool cur = hotkey != 0 && (::GetAsyncKeyState(hotkey) & 0x8000) != 0;
+#else
+      bool cur = false;
+#endif
+      if (cur && !m_parent->m_prevHotkeyState)
+        m_parent->ToggleCACAO();
+      m_parent->m_prevHotkeyState = cur;
+    }
+
+    // Inject CACAO ambient occlusion before the present blit and wire
+    // the AO result into the blitter for composite during present.
+    m_parent->TryApplyCACAO(swapImage->info().extent.width, swapImage->info().extent.height);
+    m_blitter->setAoView(m_parent->GetCacaoAoView(),
+                         m_parent->GetOptions()->cacaoDebugView);
+
     // Presentation semaphores and WSI swap chain image
     PresenterSync sync = { };
     Rc<DxvkImage> backBuffer;

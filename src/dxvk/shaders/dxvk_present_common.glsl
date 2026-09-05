@@ -12,6 +12,8 @@ layout(constant_id = 4) const uint c_dst_color_space = VK_COLOR_SPACE_SRGB_NONLI
 layout(constant_id = 5) const bool c_dst_is_srgb = true;
 layout(constant_id = 6) const bool c_composite_hud = false;
 layout(constant_id = 7) const bool c_composite_cursor = false;
+layout(constant_id = 8) const bool c_composite_ao = false;
+layout(constant_id = 9) const bool c_ao_debug_view = false;  // show raw AO buffer
 
 layout(set = 0, binding = 0) uniform sampler s_samplers[];
 
@@ -20,6 +22,7 @@ layout(set = 1, binding = 0) uniform texture2DMS s_image_ms;
 layout(set = 1, binding = 1) uniform texture1D s_gamma;
 layout(set = 1, binding = 2) uniform texture2D s_hud;
 layout(set = 1, binding = 3) uniform texture2D s_cursor;
+layout(set = 1, binding = 4) uniform texture2D s_ao;
 
 layout(push_constant)
 uniform present_info_t {
@@ -46,6 +49,14 @@ vec4 blend_linear_sdr(vec4 dst, vec4 src) {
 
 vec4 composite_image(vec4 color) {
   ivec2 coord = ivec2(gl_FragCoord.xy);
+
+  if (c_composite_ao) {
+    float ao = texelFetch(s_ao, coord, 0).r;
+    if (c_ao_debug_view)
+      color.rgb = vec3(ao);  // show raw AO greyscale, skip HUD/cursor
+    else
+      color.rgb *= max(0.0, 1.0 - ao);  // CACAO writes raw occlusion; convert to occlusion factor
+  }
 
   if (c_composite_hud)
     color = blend_linear_sdr(color, texelFetch(s_hud, coord, 0));

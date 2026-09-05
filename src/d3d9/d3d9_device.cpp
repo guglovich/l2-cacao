@@ -1,4 +1,8 @@
+#define _USE_MATH_DEFINES
+#include <cmath>
 #include "d3d9_device.h"
+#include "d3d9_cacao_log.h"
+#include "../dxvk/hud/dxvk_hud_cacao.h"
 
 #include "d3d9_annotation.h"
 #include "d3d9_common_texture.h"
@@ -62,7 +66,8 @@ namespace dxvk {
     , m_d3d9On12Args       ( pAdapter->Get9On12Args() )
     , m_d3d9On12           ( this )
     , m_legacyD3DBridge    ( this )
-    , m_d3dCompatibility   ( pParent->GetD3DCompatibilityFlags() ) {
+    , m_d3dCompatibility   ( pParent->GetD3DCompatibilityFlags() )
+    , m_cacao              ( m_dxvkDevice.ptr() ) {
 
     InitShaderOptions();
 
@@ -151,6 +156,27 @@ namespace dxvk {
     BindFFUbershader<D3D9ShaderType::PixelShader>();
 
     m_unlockAdditionalFormats = m_parent->HasFormatsUnlocked();
+
+    // Apply CACAO config from options
+    {
+      const D3D9Options* opt = GetOptions();
+      m_cacao.SetEnabled(opt->cacaoEnable);
+      m_cacao.SetConfig(
+        opt->cacaoRadius,
+        opt->cacaoStrength,
+        opt->cacaoShadowClamp,
+        (CacaoQuality)dxvk::clamp(opt->cacaoQuality, 0, 3));
+      m_cacaoHotkey = opt->cacaoHotkey;
+      hud::g_cacaoEnabled.store(opt->cacaoEnable);
+      hud::g_cacaoQuality.store(opt->cacaoQuality);
+      CacaoLogger::get().log(str::format(
+        "[CONFIG] enable=", (int)opt->cacaoEnable,
+        " quality=", opt->cacaoQuality,
+        " radius=", opt->cacaoRadius,
+        " strength=", opt->cacaoStrength,
+        " clamp=", opt->cacaoShadowClamp,
+        " hotkey=", opt->cacaoHotkey));
+    }
   }
 
 
@@ -1821,6 +1847,9 @@ namespace dxvk {
         m_dirty.set(D3D9DeviceDirtyFlag::DepthBias);
       }
     }
+
+    if (ds != nullptr)
+      m_cacaoLastDepthImg = ds->GetCommonTexture()->GetImage();
 
     m_state.depthStencil = ds;
 
@@ -3608,12 +3637,22 @@ namespace dxvk {
           UINT   Vector4fCount) {
     D3D9DeviceLock lock = LockDevice();
 
-    return SetShaderConstants<
+    HRESULT hr = SetShaderConstants<
       D3D9ShaderType::VertexShader,
       D3D9ConstantType::Float>(
         StartRegister,
         pConstantData,
         Vector4fCount);
+
+    // Strategy A: Scan vertex shader constants for projection matrix pattern
+    // UE2 stores projection matrix in VS constants (not via SetTransform)
+    // Projection matrix has a unique pattern: row 3 = (0,0,1,0) or (0,0,-1,0)
+    if (SUCCEEDED(hr) && m_cacao.IsInitialized() && m_cacao.IsEnabled()
+        && Vector4fCount >= 4 && StartRegister < 32) {
+      TryExtractProjectionFromVSConstants(StartRegister, pConstantData, Vector4fCount);
+    }
+
+    return hr;
   }
 
 
@@ -4656,6 +4695,29 @@ namespace dxvk {
       return m_recorder->SetStateTransform(idx, pMatrix);
 
     m_state.transforms[idx] = ConvertMatrix(pMatrix);
+
+    // Cache projection matrix for CACAO from SetTransform (UE2 uses vertex shaders,
+    // so projection matrix is not available during draw calls)
+    if (idx == GetTransformIndex(D3DTS_PROJECTION)) {
+      const Matrix4& m = m_state.transforms[idx];
+      CacaoLogger::get().log(str::format(
+        "[SETTRANSFORM] D3DTS_PROJECTION: [",
+        m[0][0], ", ", m[1][1], ", ", m[2][2], ", ", m[3][2], "]"));
+
+      // Cache non-identity projection matrix for CACAO
+      // UE2 sets projection matrix once at init, not per-frame
+      if (!m_cacaoHasValidProj) {
+        if (m[0][0] != 1.0f || m[1][1] != 1.0f || m[3][2] != 0.0f) {
+          m_cacaoLastProj = m;
+          m_cacaoHasValidProj = true;
+          CacaoLogger::get().log(str::format(
+            "[PROJ-CACHE] Cached projection matrix from SetTransform: [",
+            m[0][0], ", ", m[1][1], ", ", m[2][2], ", ", m[3][2], "]"));
+        } else {
+          CacaoLogger::get().log("[PROJ] Identity matrix, skipping projection matrix cache");
+        }
+      }
+    }
 
     m_dirty.set(D3D9DeviceDirtyFlag::FFVertexData);
 
@@ -7547,6 +7609,24 @@ namespace dxvk {
       UpdatePushData();
 
     ApplyPrimitiveType(PrimitiveType);
+
+    // Cache projection matrix for CACAO.
+    // UE2 stores projection in vertex shader constants (not SetTransform),
+    // so we use multi-strategy approach:
+    //   A) Extract from VS constants (real-time hook in SetVertexShaderConstantF)
+    //   B) Build from UE2 defaults (FOV 72°, near=16, far=32768)
+    //   C) Scan all cached constants
+    if (m_cacao.IsInitialized() && m_cacao.IsEnabled() && m_state.depthStencil != nullptr) {
+      // Save backbuffer dimensions for UE2 fallback
+      if (m_state.renderTargets[0] != nullptr) {
+        auto rtImg = m_state.renderTargets[0]->GetCommonTexture()->GetImage();
+        m_cacaoLastWidth  = rtImg->info().extent.width;
+        m_cacaoLastHeight = rtImg->info().extent.height;
+      }
+      // Projection matrix is now cached from SetTransform (UE2 uses vertex shaders)
+      // Try fallback strategies if we still don't have a valid matrix
+      TryExtractProjectionFromAllConstants();
+    }
   }
 
 
@@ -9308,6 +9388,244 @@ namespace dxvk {
 
     /* ignore failures for legacy Proton implementation */
     return true;
+  }
+
+
+  // ── Strategy A: Try to extract projection matrix from vertex shader constants ──
+  // Projection matrix in D3D9 has a unique pattern in row 3: (0, 0, ±1, 0)
+  // UE2 typically stores it in registers c4-c7 or c8-c11
+  void D3D9DeviceEx::TryExtractProjectionFromVSConstants(
+          UINT   StartRegister,
+    const float* pConstantData,
+          UINT   Vector4fCount) {
+    // Need at least 4 consecutive float4 registers to form a 4x4 matrix
+    if (Vector4fCount < 4 || StartRegister + Vector4fCount > 32)
+      return;
+
+    // Scan through the newly written constants looking for projection matrix pattern
+    for (UINT base = StartRegister; base + 3 < StartRegister + Vector4fCount && base + 3 < 32; base++) {
+      const float* r0 = &pConstantData[(base     - StartRegister) * 4];
+      const float* r1 = &pConstantData[(base + 1 - StartRegister) * 4];
+      const float* r2 = &pConstantData[(base + 2 - StartRegister) * 4];
+      const float* r3 = &pConstantData[(base + 3 - StartRegister) * 4];
+
+      // D3D9 projection matrix pattern check:
+      // Row 0: (x, 0, 0, 0) or (x, 0, 0, 1) - only element [0] is significant
+      // Row 1: (0, y, 0, 0) or (0, y, 0, 1) - only element [1] is significant
+      // Row 2: (0, 0, z, w) - elements [2] and [3] are significant
+      // Row 3: (0, 0, 1, 0) or (0, 0, -1, 0) - element [2] = ±1, [3] = 0
+
+      bool row0_ok = std::abs(r0[1]) < 0.001f && std::abs(r0[2]) < 0.001f && std::abs(r0[0]) > 0.1f;
+      bool row1_ok = std::abs(r1[0]) < 0.001f && std::abs(r1[2]) < 0.001f && std::abs(r1[1]) > 0.1f;
+      bool row2_ok = std::abs(r2[0]) < 0.001f && std::abs(r2[1]) < 0.001f && std::abs(r2[2]) > 0.1f;
+      bool row3_ok = std::abs(r3[0]) < 0.001f && std::abs(r3[1]) < 0.001f
+                    && (std::abs(r3[2] - 1.0f) < 0.01f || std::abs(r3[2] + 1.0f) < 0.01f)
+                    && std::abs(r3[3]) < 0.001f;
+
+      if (row0_ok && row1_ok && row2_ok && row3_ok) {
+        // Found projection matrix! Store it
+        m_cacaoLastProj[0][0] = r0[0]; m_cacaoLastProj[0][1] = r0[1];
+        m_cacaoLastProj[0][2] = r0[2]; m_cacaoLastProj[0][3] = r0[3];
+        m_cacaoLastProj[1][0] = r1[0]; m_cacaoLastProj[1][1] = r1[1];
+        m_cacaoLastProj[1][2] = r1[2]; m_cacaoLastProj[1][3] = r1[3];
+        m_cacaoLastProj[2][0] = r2[0]; m_cacaoLastProj[2][1] = r2[1];
+        m_cacaoLastProj[2][2] = r2[2]; m_cacaoLastProj[2][3] = r2[3];
+        m_cacaoLastProj[3][0] = r3[0]; m_cacaoLastProj[3][1] = r3[1];
+        m_cacaoLastProj[3][2] = r3[2]; m_cacaoLastProj[3][3] = r3[3];
+        m_cacaoHasValidProj = true;
+        CacaoLogger::get().log(str::format(
+          "[VS-CONST] Found projection matrix at c", base,
+          ": proj[0][0]=", r0[0], " proj[1][1]=", r1[1],
+          " proj[2][2]=", r2[2], " proj[3][2]=", r3[2]));
+        return;
+      }
+    }
+  }
+
+
+  // ── Strategy B: Build projection matrix from UE2 default parameters ──
+  // UE2 defaults: FOV=72°, near=16, far=32768, aspect=width/height
+  void D3D9DeviceEx::BuildUE2ProjectionMatrix(Matrix4& out, uint32_t width, uint32_t height) {
+    float fov    = 72.0f * float(M_PI) / 180.0f;  // UE2 default FOV
+    float nearZ  = 16.0f;                          // UE2 default near plane
+    float farZ   = 32768.0f;                       // UE2 default far plane
+    float aspect = float(width) / float(height);
+    float fovY   = fov;                             // UE2 uses vertical FOV
+    float yScale = 1.0f / std::tan(fovY / 2.0f);
+    float xScale = yScale / aspect;
+
+    // D3D9 projection matrix (row-major):
+    // [ xScale, 0,       0,                    0 ]
+    // [ 0,      yScale,  0,                    0 ]
+    // [ 0,      0,       far/(far-near),       1 ]
+    // [ 0,      0,      -near*far/(far-near),  0 ]
+    float zn = nearZ, zf = farZ;
+    float c = zf / (zf - zn);
+    float d = -(zn * zf) / (zf - zn);
+
+    out[0][0] = xScale;  out[0][1] = 0;       out[0][2] = 0;     out[0][3] = 0;
+    out[1][0] = 0;       out[1][1] = yScale;  out[1][2] = 0;     out[1][3] = 0;
+    out[2][0] = 0;       out[2][1] = 0;       out[2][2] = c;     out[2][3] = 1;
+    out[3][0] = 0;       out[3][1] = 0;       out[3][2] = d;     out[3][3] = 0;
+  }
+
+
+  // ── Strategy C: Scan all cached VS constants for projection matrix ──
+  void D3D9DeviceEx::TryExtractProjectionFromAllConstants() {
+    if (m_cacaoHasValidProj)
+      return;  // Already have a valid matrix
+
+    const auto& vsConsts = m_state.vsConsts.get();  // Get D3D9ShaderConstantsVSSoftware from static_item
+    // Scan registers c0-c31 for projection matrix pattern
+    for (UINT base = 0; base + 3 < 32; base++) {
+      const float* r0 = vsConsts.fConsts[base].data;
+      const float* r1 = vsConsts.fConsts[base + 1].data;
+      const float* r2 = vsConsts.fConsts[base + 2].data;
+      const float* r3 = vsConsts.fConsts[base + 3].data;
+
+      bool row0_ok = std::abs(r0[1]) < 0.001f && std::abs(r0[2]) < 0.001f && std::abs(r0[0]) > 0.1f;
+      bool row1_ok = std::abs(r1[0]) < 0.001f && std::abs(r1[2]) < 0.001f && std::abs(r1[1]) > 0.1f;
+      bool row2_ok = std::abs(r2[0]) < 0.001f && std::abs(r2[1]) < 0.001f && std::abs(r2[2]) > 0.1f;
+      bool row3_ok = std::abs(r3[0]) < 0.001f && std::abs(r3[1]) < 0.001f
+                    && (std::abs(r3[2] - 1.0f) < 0.01f || std::abs(r3[2] + 1.0f) < 0.01f)
+                    && std::abs(r3[3]) < 0.001f;
+
+      if (row0_ok && row1_ok && row2_ok && row3_ok) {
+        m_cacaoLastProj[0][0] = r0[0]; m_cacaoLastProj[0][1] = r0[1];
+        m_cacaoLastProj[0][2] = r0[2]; m_cacaoLastProj[0][3] = r0[3];
+        m_cacaoLastProj[1][0] = r1[0]; m_cacaoLastProj[1][1] = r1[1];
+        m_cacaoLastProj[1][2] = r1[2]; m_cacaoLastProj[1][3] = r1[3];
+        m_cacaoLastProj[2][0] = r2[0]; m_cacaoLastProj[2][1] = r2[1];
+        m_cacaoLastProj[2][2] = r2[2]; m_cacaoLastProj[2][3] = r2[3];
+        m_cacaoLastProj[3][0] = r3[0]; m_cacaoLastProj[3][1] = r3[1];
+        m_cacaoLastProj[3][2] = r3[2]; m_cacaoLastProj[3][3] = r3[3];
+        m_cacaoHasValidProj = true;
+        CacaoLogger::get().log(str::format(
+          "[VS-SCAN] Found projection matrix at c", base,
+          ": proj[0][0]=", r0[0], " proj[1][1]=", r1[1],
+          " proj[2][2]=", r2[2], " proj[3][2]=", r3[2]));
+        return;
+      }
+    }
+
+    // Strategy B fallback: build from UE2 defaults
+    if (!m_cacaoHasValidProj && m_cacaoLastWidth > 0 && m_cacaoLastHeight > 0) {
+      BuildUE2ProjectionMatrix(m_cacaoLastProj, m_cacaoLastWidth, m_cacaoLastHeight);
+      m_cacaoHasValidProj = true;
+      CacaoLogger::get().log(str::format(
+        "[UE2-FB] Built projection from UE2 defaults (", m_cacaoLastWidth, "x", m_cacaoLastHeight,
+        "): proj[0][0]=", m_cacaoLastProj[0][0], " proj[1][1]=", m_cacaoLastProj[1][1],
+        " proj[2][2]=", m_cacaoLastProj[2][2], " proj[3][2]=", m_cacaoLastProj[3][2]));
+    }
+  }
+
+
+  void D3D9DeviceEx::TryApplyCACAO(uint32_t width, uint32_t height) {
+    if (!m_cacao.IsInitialized() || !m_cacao.IsEnabled())
+      return;
+
+    // Diagnostic: log every 300 frames whether Apply actually runs
+    static uint32_t s_frameCount = 0;
+    bool doLog = (++s_frameCount % 300 == 0);
+
+    // Use the last non-null depth image seen during rendering.
+    // Many D3D9 games call SetDepthStencilSurface(nullptr) before Present
+    // (e.g. for UI passes), so m_state.depthStencil is null at present time.
+    Rc<DxvkImage> depthImg = m_cacaoLastDepthImg;
+    if (depthImg == nullptr) {
+      if (doLog) CacaoLogger::get().log("[FRAME] TryApply: skip (no depth)");
+      return;
+    }
+
+    // If MSAA depth — resolve into single-sample via DXVK public API.
+    // EmitCs here is safe: Flush() was already called before TryApplyCACAO,
+    // so the render pass is closed and depth is fully written.
+    if (depthImg->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+      const auto& di = depthImg->info();
+      bool needNew = !m_cacaoDepthResolved
+        || m_cacaoDepthResolved->info().extent.width  != di.extent.width
+        || m_cacaoDepthResolved->info().extent.height != di.extent.height
+        || m_cacaoDepthResolved->info().format        != di.format;
+
+      if (needNew) {
+        DxvkImageCreateInfo rci = {};
+        rci.type        = VK_IMAGE_TYPE_2D;
+        rci.format      = di.format;
+        rci.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+        rci.extent      = di.extent;
+        rci.numLayers   = 1;
+        rci.mipLevels   = 1;
+        rci.usage       = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                        | VK_IMAGE_USAGE_SAMPLED_BIT;
+        rci.stages      = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                        | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                        | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        rci.access      = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                        | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                        | VK_ACCESS_SHADER_READ_BIT;
+        rci.layout      = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        rci.tiling      = VK_IMAGE_TILING_OPTIMAL;
+        m_cacaoDepthResolved = GetDXVKDevice()->createImage(
+          rci, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (doLog) CacaoLogger::get().log("[FRAME] Created MSAA resolve target");
+      }
+
+      Rc<DxvkImage> src = depthImg;
+      Rc<DxvkImage> dst = m_cacaoDepthResolved;
+      EmitCs([src, dst](DxvkContext* cs) {
+        VkImageResolve region = {};
+        region.srcSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+        region.dstSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+        region.extent         = src->info().extent;
+        cs->resolveImage(dst, src, region,
+          src->info().format,
+          VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+          VK_RESOLVE_MODE_NONE);
+      });
+
+      depthImg = m_cacaoDepthResolved;
+    }
+
+    // Use the cached projection matrix from SetTransform.
+    // Note: TryApplyCACAO is called during Present, when UE2 may have already
+    // reset the projection matrix to identity for the next frame.
+    // Therefore we rely on m_cacaoHasValidProj (cached matrix) instead of
+    // checking the current projection matrix.
+    // Advance frame index first to ensure consistent indexing.
+    m_cacao.AdvanceFrameIndex();
+
+    // Check if current frame has a valid depth buffer (UI frames have null depth)
+    if (m_state.depthStencil == nullptr) {
+      // UI frame: fill AO buffer with 1.0 (no occlusion)
+      m_cacao.FillAoBuffer(this, 1.0f);
+      if (doLog) CacaoLogger::get().log("[FRAME] TryApply: UI frame (no depth), filled AO=1.0");
+      return;
+    }
+
+    // Check if we have a cached projection matrix
+    if (!m_cacaoHasValidProj) {
+      // No projection matrix yet: fill AO buffer with 1.0
+      m_cacao.FillAoBuffer(this, 1.0f);
+      if (doLog) CacaoLogger::get().log("[FRAME] TryApply: no cached proj matrix, filled AO=1.0");
+      return;
+    }
+
+    // Game frame: apply CACAO with cached projection matrix
+    // We use the cached matrix because currentProj may be identity at Present time
+    if (doLog) CacaoLogger::get().log(str::format(
+      "[FRAME] TryApply: RUNNING frame=", s_frameCount,
+      " depthFmt=", (int)depthImg->info().format));
+
+    m_cacao.Apply(this, depthImg, reinterpret_cast<const float*>(&m_cacaoLastProj), width, height,
+                  GetOptions()->cacaoDebugFill);
+  }
+
+
+  void D3D9DeviceEx::ToggleCACAO() {
+    bool newState = !m_cacao.IsEnabled();
+    m_cacao.SetEnabled(newState);
+    hud::g_cacaoEnabled.store(newState);
+    CacaoLogger::get().log(str::format("[HOTKEY] CACAO toggled -> ", newState ? "ON" : "OFF"));
   }
 
 }

@@ -6,6 +6,22 @@
 
 namespace dxvk {
 
+  static int32_t parseCacaoHotkey(const std::string& rawName) {
+    // Convert to lowercase for case-insensitive match
+    std::string name = rawName;
+    for (char& c : name)
+      c = (char)tolower((unsigned char)c);
+
+    if (name == "insert")     return 0x2D;  // VK_INSERT
+    if (name == "delete")     return 0x2E;  // VK_DELETE
+    if (name == "scrolllock") return 0x91;  // VK_SCROLL
+    if (name == "pause")      return 0x13;  // VK_PAUSE
+    if (name == "rightalt")   return 0xA5;  // VK_RMENU
+    if (name == "rightctrl")  return 0xA3;  // VK_RCONTROL
+    if (name == "none" || name == "0") return 0;
+    return 0x2D;  // default: Insert
+  }
+
   static int32_t parsePciId(const std::string& str) {
     if (str.size() != 4)
       return -1;
@@ -110,6 +126,19 @@ namespace dxvk {
     }
 
     this->shaderDumpPath = env::getEnvVar("DXVK_SHADER_DUMP_PATH");
+
+    // CACAO ambient occlusion options
+    this->cacaoEnable      = config.getOption<bool>       ("d3d9.cacaoEnable",      true);
+    this->cacaoQuality     = config.getOption<int32_t>    ("d3d9.cacaoQuality",     2);
+    this->cacaoRadius      = config.getOption<float>      ("d3d9.cacaoRadius",      1.2f);
+    this->cacaoStrength    = config.getOption<float>      ("d3d9.cacaoStrength",    1.0f);
+    this->cacaoShadowClamp = config.getOption<float>      ("d3d9.cacaoShadowClamp", 0.98f);
+    this->cacaoHotkey      = parseCacaoHotkey(
+      config.getOption<std::string>("d3d9.cacaoHotkey", "Insert"));
+    this->cacaoDebugFill   = config.getOption<bool>       ("d3d9.cacaoDebugFill",  false);
+    this->cacaoDebugView   = config.getOption<bool>       ("d3d9.cacaoDebugView",  false);
+
+    this->cacaoQuality = dxvk::clamp(this->cacaoQuality, (int32_t)0, (int32_t)3);
   }
 
 }
