@@ -1601,6 +1601,10 @@ namespace dxvk {
     // UE2 stores projection matrix in vertex shader constants, not SetTransform.
     Matrix4                         m_cacaoLastProj    = {};
     bool                            m_cacaoHasValidProj = false;
+    // True once a projection matrix was recovered from vertex shader
+    // constants (the matrix actually used by UE2's scene shaders).
+    // SetTransform-derived matrices only fill in until then.
+    bool                            m_cacaoProjFromVS  = false;
     uint32_t                        m_cacaoLastWidth   = 0;     // For UE2 fallback projection
     uint32_t                        m_cacaoLastHeight  = 0;
 
