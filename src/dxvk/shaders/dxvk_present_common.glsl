@@ -34,6 +34,9 @@ uniform present_info_t {
   uint sampler_gamma;
   uint sampler_cursor;
   float ao_dark_mask;
+  float ao_contact_t0;
+  float ao_contact_t1;
+  float ao_contact_strength;
 };
 
 
@@ -61,7 +64,19 @@ vec4 composite_image(vec4 color) {
       // baked shadow areas are not darkened twice. Full effect on lit pixels.
       float lum  = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
       float mask = 1.0 - ao_dark_mask * (1.0 - min(lum * 3.0, 1.0));
-      color.rgb *= mix(1.0, ao, mask);  // CACAO writes visibility: 1.0 = lit, 0.0 = occluded
+      float aoApplied = mix(1.0, ao, mask);  // CACAO visibility: 1.0 = lit, 0.0 = occluded
+
+      // Contact mode: apply AO only where occlusion is significant.
+      // Open ground stays untouched (no global wash); wall bases, crevices
+      // and object contacts get full-strength localized shadows.
+      if (ao_contact_strength > 0.0) {
+        float occ     = 1.0 - aoApplied;
+        float contact = smoothstep(ao_contact_t0, ao_contact_t1, occ)
+                      * ao_contact_strength;
+        color.rgb *= 1.0 - contact;
+      } else {
+        color.rgb *= aoApplied;
+      }
     }
   }
 

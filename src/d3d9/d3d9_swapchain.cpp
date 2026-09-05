@@ -864,9 +864,13 @@ namespace dxvk {
     // Inject CACAO ambient occlusion before the present blit and wire
     // the AO result into the blitter for composite during present.
     m_parent->TryApplyCACAO(swapImage->info().extent.width, swapImage->info().extent.height);
+    const D3D9Options* cacaoOpts = m_parent->GetOptions();
     m_blitter->setAoView(m_parent->GetCacaoAoView(),
-                         m_parent->GetOptions()->cacaoDebugView,
-                         m_parent->GetOptions()->cacaoDarkMask);
+                         cacaoOpts->cacaoDebugView,
+                         cacaoOpts->cacaoDarkMask,
+                         cacaoOpts->cacaoContactT0,
+                         cacaoOpts->cacaoContactT1,
+                         cacaoOpts->cacaoContactStrength);
 
     // Presentation semaphores and WSI swap chain image
     PresenterSync sync = { };
