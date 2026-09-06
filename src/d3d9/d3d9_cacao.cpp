@@ -38,6 +38,8 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <vector>
+#include <cstdio>
 
 // ── Compiled SPIR-V headers (compiled from FidelityFX SDK GLSL) ───────────────
 #include "cacao_spirv/ffx_cacao_prepare_native_depths_and_mips_pass.h"
@@ -540,9 +542,12 @@ void D3D9CacaoRenderer::InitResources(uint32_t w, uint32_t h) {
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
   }
 
-  // Readback buffer: 1024 bytes = 4 B depth + 8 B ssao @16 + 512 B ao strip @64
+  // Readback buffer: strip @0/16/64 + full-buffer dump regions:
+  //   aoFinal 1920x1080 RGBA16F (16.6 MB)  @ 0
+  //   deintD  layer0 960x540  R32F  (2.1 MB)  @ 16 MB
+  //   ssao    layer0 960x540  RG32F (4.1 MB)  @ 19 MB
   DxvkBufferCreateInfo rbci = {};
-  rbci.size   = 1024u;
+  rbci.size   = 32u * 1024u * 1024u;
   rbci.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   rbci.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
   rbci.access = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -768,6 +773,75 @@ void D3D9CacaoRenderer::FillAoBuffer(D3D9DeviceEx* device, float value) {
   });
 }
 
+
+// ── WriteDumpFiles: convert staging buffer contents to PGM images ────────────
+void D3D9CacaoRenderer::WriteDumpFiles(uint32_t slot) {
+  if (!m_readbackBuffer || m_width == 0)
+    return;
+
+  const uint8_t* base = reinterpret_cast<const uint8_t*>(m_readbackBuffer->mapPtr(0));
+
+  BufSizeInfo bsi;
+  calcBufSizeInfo(m_width, m_height, &bsi);
+
+  auto half2f = [](uint16_t h) -> float {
+    uint32_t sign = (h >> 15) & 0x1, ex = (h >> 10) & 0x1f, mt = h & 0x3ff;
+    uint32_t f = (ex == 0) ? ((sign << 31) | (mt << 13))
+               : ((sign << 31) | ((ex == 31 ? 0x7f800000u : ((ex + 112u) << 23)) | (mt << 13)));
+    float r; std::memcpy(&r, &f, 4); return r;
+  };
+
+  const char* tag = slot == 0 ? "A" : "B";
+
+  auto writePgm = [&](const char* name, uint32_t w, uint32_t h, const std::vector<uint8_t>& px) {
+    FILE* f = fopen(name, "wb");
+    if (!f) return;
+    fprintf(f, "P5\n%u %u\n255\n", w, h);
+    fwrite(px.data(), 1, px.size(), f);
+    fclose(f);
+  };
+
+  // 1) aoFinal: RGBA16F, R = visibility
+  {
+    std::vector<uint8_t> px(size_t(m_width) * m_height);
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(base);
+    for (uint32_t i = 0; i < px.size(); i++)
+      px[i] = uint8_t(dxvk::clamp(half2f(src[i * 4 + 0]), 0.0f, 1.0f) * 255.0f);
+    char name[64];
+    snprintf(name, sizeof(name), "cacaodump_%s_ao.pgm", tag);
+    writePgm(name, m_width, m_height, px);
+  }
+
+  // 2) deinterleaved depth layer 0: R32F viewZ, log scale
+  {
+    std::vector<uint8_t> px(size_t(bsi.deinterleavedDepthBufferWidth) * bsi.deinterleavedDepthBufferHeight);
+    const float* src = reinterpret_cast<const float*>(base + 16u * 1024u * 1024u);
+    const float maxZ = 30000.0f, invLog = 1.0f / std::log(1.0f + maxZ);
+    for (uint32_t i = 0; i < px.size(); i++) {
+      float z = src[i] < 0.0f ? 0.0f : src[i];
+      px[i] = uint8_t(std::log(1.0f + z) * invLog * 255.0f);
+    }
+    char name[64];
+    snprintf(name, sizeof(name), "cacaodump_%s_depth.pgm", tag);
+    writePgm(name, bsi.deinterleavedDepthBufferWidth, bsi.deinterleavedDepthBufferHeight, px);
+  }
+
+  // 3) blurred SSAO layer 0: RG32F (R = visibility, G = packed edges)
+  {
+    std::vector<uint8_t> px(size_t(bsi.ssaoBufferWidth) * bsi.ssaoBufferHeight);
+    const float* src = reinterpret_cast<const float*>(base + 19u * 1024u * 1024u);
+    for (uint32_t i = 0; i < px.size(); i++)
+      px[i] = uint8_t(dxvk::clamp(src[i * 2 + 0], 0.0f, 1.0f) * 255.0f);
+    char name[64];
+    snprintf(name, sizeof(name), "cacaodump_%s_ssao.pgm", tag);
+    writePgm(name, bsi.ssaoBufferWidth, bsi.ssaoBufferHeight, px);
+  }
+
+  CacaoLogger::get().log(str::format(
+    "[DUMP] wrote cacaodump_", tag, "_*.pgm (ao ", m_width, "x", m_height,
+    ", depth/ssao ", bsi.ssaoBufferWidth, "x", bsi.ssaoBufferHeight, ")"));
+}
+
 // ── Apply ──────────────────────────────────────────────────────────────────────
 void D3D9CacaoRenderer::Apply(
     D3D9DeviceEx*  device,
@@ -821,6 +895,27 @@ void D3D9CacaoRenderer::Apply(
       " aoStrip[min=", aoMin, " max=", aoMax, "]",
       " first4=", half2float(strip[0]), ",", half2float(strip[4]), ",",
       half2float(strip[8]), ",", half2float(strip[12])));
+  }
+
+  m_applyCount++;
+
+  bool dumpEnabled = m_dumpEnabled && m_readbackBuffer != nullptr;
+
+  // ── Host-side write of a completed full-buffer dump ────────────────────
+  if (m_dumpWritePending && m_applyCount >= m_dumpWriteAt) {
+    m_dumpWritePending = false;
+    WriteDumpFiles(m_dumpWriteSlot);
+  }
+
+  // Issue a new dump when enabled (alternates A/B slots)
+  if (dumpEnabled && !m_dumpWritePending && m_applyCount >= m_dumpWriteAt) {
+    m_dumpWritePending = true;
+    m_dumpWriteAt      = m_applyCount + kFrameLag;
+    m_dumpWriteSlot    = m_dumpSlot;
+    m_dumpSlot        ^= 1u;
+    CacaoLogger::get().log(str::format(
+      "[DUMP] issuing full-buffer dump slot=", m_dumpWriteSlot == 0 ? "A" : "B",
+      " apply=", m_applyCount));
   }
 
   // Log first successful Apply call with diagnostic info
@@ -919,7 +1014,7 @@ void D3D9CacaoRenderer::Apply(
 
   // Decide whether to issue a readback this frame
   m_readbackFrameCount++;
-  bool doReadback = (m_readbackFrameCount % kReadbackInterval == 0) && m_readbackBuffer;
+  bool doReadback = ((m_readbackFrameCount % kReadbackInterval == 0) || dumpEnabled) && m_readbackBuffer;
   Rc<DxvkBuffer> readbackBuf = doReadback ? m_readbackBuffer : nullptr;
   if (doReadback)
     m_readbackPending = true;
@@ -930,7 +1025,7 @@ void D3D9CacaoRenderer::Apply(
     pipelines, pipeLayouts,
     frameSets /* copied by value (array of VkDescriptorSet handles) */,
     w, h, bsiCopy, quality, debugFill,
-    readbackBuf
+    readbackBuf, dumpEnabled
   ] (DxvkContext* cs) mutable {
 
     cs->beginExternalRendering();
@@ -1388,6 +1483,19 @@ void D3D9CacaoRenderer::Apply(
       // 3) aoFinal strip 64x1 from the vertical center
       copyRegion(64, aoFinal,    VK_IMAGE_ASPECT_COLOR_BIT,
                  int32_t(w / 2) - 32, int32_t(h / 2), 64, 1);
+
+      // 4) Full-buffer dump (rotating A/B) when enabled in config
+      if (dumpEnabled) {
+        // aoFinal, full extent
+        copyRegion(0u * 1024u * 1024u, aoFinal,   VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, w, h);
+        // deinterleaved depth, layer 0, mip 0
+        copyRegion(16u * 1024u * 1024u, deintD,   VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+                   bsiCopy.deinterleavedDepthBufferWidth,
+                   bsiCopy.deinterleavedDepthBufferHeight);
+        // pre-blur... post-blur SSAO, layer 0
+        copyRegion(19u * 1024u * 1024u, finalSsao, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+                   bsiCopy.ssaoBufferWidth, bsiCopy.ssaoBufferHeight);
+      }
 
       cmd->track(readbackBuf, DxvkAccess::Write);
     }

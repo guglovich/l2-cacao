@@ -136,6 +136,7 @@ namespace dxvk {
     this->cacaoHotkey      = parseCacaoHotkey(
       config.getOption<std::string>("d3d9.cacaoHotkey", "Insert"));
     this->cacaoDarkMask    = config.getOption<float>      ("d3d9.cacaoDarkMask",   0.7f);
+    this->cacaoDump        = config.getOption<bool>       ("d3d9.cacaoDump",       false);
     this->cacaoContactT0   = config.getOption<float>      ("d3d9.cacaoContactT0",  0.12f);
     this->cacaoContactT1   = config.getOption<float>      ("d3d9.cacaoContactT1",  0.30f);
     this->cacaoContactStrength = config.getOption<float>  ("d3d9.cacaoContactStrength", 0.0f);

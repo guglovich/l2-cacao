@@ -124,6 +124,8 @@ namespace dxvk {
     // Advance frame index for double-buffering (call before Apply/FillAoBuffer)
     void AdvanceFrameIndex() { m_frameIndex = (m_frameIndex + 1u) % kFrameLag; }
 
+    void SetDumpEnabled(bool enabled) { m_dumpEnabled = enabled; }
+
   private:
     void InitPipelines();
     void InitResources(uint32_t width, uint32_t height);
@@ -203,6 +205,22 @@ namespace dxvk {
     uint32_t          m_readbackFrameCount = 0u;
     Rc<DxvkBuffer>    m_readbackBuffer;   // 8 bytes: one RGBA16F pixel
     bool              m_readbackPending   = false; // GPU copy issued, not yet read
+
+    // ── Full-buffer dump (cacaodump_A/B rotating pair) ──────────────────
+    // Every readback frame with cacaoDump enabled copies the full AO result,
+    // deinterleaved depth layer 0 and pre-blur SSAO layer 0 into a staging
+    // buffer; the host then writes PGM images into the game CWD. Slot A/B
+    // alternate, so the two files always hold the last two dumped frames
+    // (works as an instant flicker diff pair and captures whatever scene
+    // the user was in when they quit the game).
+    bool              m_dumpEnabled       = false;
+    uint32_t          m_dumpSlot          = 0;      // 0=A, 1=B
+    bool              m_dumpWritePending  = false;
+    uint32_t          m_dumpWriteSlot     = 0;
+    uint32_t          m_dumpWriteAt       = 0;
+    uint32_t          m_applyCount        = 0;
+
+    void              WriteDumpFiles(uint32_t slot);
   };
 
 }

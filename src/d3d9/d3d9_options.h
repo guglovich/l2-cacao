@@ -181,6 +181,7 @@ namespace dxvk {
     float   cacaoShadowClamp;  ///< Shadow clamp 0-1 (default: 0.98)
     int32_t cacaoHotkey;       ///< VK_ keycode for toggle hotkey (default: VK_INSERT = 0x2D)
     float   cacaoDarkMask;     ///< Baked-lighting compensation: suppress AO on already-dark pixels (0.0-1.0, default: 0.7)
+    bool    cacaoDump;         ///< Diagnostics: write cacaodump_A/B PGM images every readback frame (default: false)
     float   cacaoContactT0;    ///< Contact mode: occlusion threshold where shadows start (default: 0.12)
     float   cacaoContactT1;    ///< Contact mode: occlusion threshold for full shadow (default: 0.30)
     float   cacaoContactStrength; ///< Contact mode: max shadow strength at full occlusion (0=off, default: 0)
