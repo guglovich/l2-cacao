@@ -167,6 +167,7 @@ namespace dxvk {
         opt->cacaoShadowClamp,
         (CacaoQuality)dxvk::clamp(opt->cacaoQuality, 0, 3));
       m_cacaoHotkey = opt->cacaoHotkey;
+      m_cacao.SetDumpEnabled(opt->cacaoDump);
       hud::g_cacaoEnabled.store(opt->cacaoEnable);
       hud::g_cacaoQuality.store(opt->cacaoQuality);
       CacaoLogger::get().log(str::format(
