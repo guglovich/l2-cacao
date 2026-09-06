@@ -1177,6 +1177,43 @@ void D3D9CacaoRenderer::Apply(
     initToGeneral(aoFinal,  1, 1);
     initToGeneral(loadCnt,  1, 1);
 
+    // ── Neutral-init importance map and load counter ─────────────────────
+    // The Q3 shader's adaptive branch (quality >= 3) samples
+    // g_ImportanceMap and g_LoadCounter, but the non-adaptive pipeline
+    // never runs the importance-map generation passes. Reading them
+    // uninitialized produced garbage extra taps (checkerboard artifacts
+    // surviving the blur). Zero importance = "no additional taps";
+    // zero counter keeps the importance limiter well-defined.
+    {
+      VkClearColorValue zeroF = {};   // impMap is R32_SFLOAT
+      VkClearColorValue zeroU = {};   // loadCnt is R32_UINT
+      VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+      cmd->cmdClearColorImage(DxvkCmdBuffer::ExecBuffer,
+        impMap->handle(),  VK_IMAGE_LAYOUT_GENERAL, &zeroF, 1, &range);
+      cmd->cmdClearColorImage(DxvkCmdBuffer::ExecBuffer,
+        loadCnt->handle(), VK_IMAGE_LAYOUT_GENERAL, &zeroU, 1, &range);
+
+      // Barrier: transfer writes above -> compute reads below
+      VkImageMemoryBarrier2 cb = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+      cb.srcStageMask  = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+      cb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+      cb.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+      cb.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+      cb.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
+      cb.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+      cb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      cb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      VkDependencyInfo cdi = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+      VkImageMemoryBarrier2 cbs[2] = { cb, cb };
+      cbs[0].image = impMap->handle();
+      cbs[0].subresourceRange = range;
+      cbs[1].image = loadCnt->handle();
+      cbs[1].subresourceRange = range;
+      cdi.imageMemoryBarrierCount = 2;
+      cdi.pImageMemoryBarriers    = cbs;
+      cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &cdi);
+    }
+
     // Use original depth image format for shader sampling
     const VkFormat fmtDepthSrv = depthImage->info().format;
 
