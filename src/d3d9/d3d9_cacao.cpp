@@ -44,6 +44,9 @@
 // ── Compiled SPIR-V headers (compiled from FidelityFX SDK GLSL) ───────────────
 #include "cacao_spirv/ffx_cacao_prepare_native_depths_and_mips_pass.h"
 #include "cacao_spirv/ffx_cacao_prepare_native_normals_pass.h"
+#include "cacao_spirv/ffx_cacao_generate_q0_pass.h"
+#include "cacao_spirv/ffx_cacao_generate_q1_pass.h"
+#include "cacao_spirv/ffx_cacao_generate_q2_pass.h"
 #include "cacao_spirv/ffx_cacao_generate_q3_pass.h"
 #include "cacao_spirv/ffx_cacao_generate_importance_map_pass.h"
 #include "cacao_spirv/ffx_cacao_generate_importance_map_a_pass.h"
@@ -358,15 +361,24 @@ void D3D9CacaoRenderer::InitPipelines() {
     { B_UAV_DEINT_NORMALS,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT },
   });
 
-  // PASS_GENERATE_Q3
-  m_setLayouts[CACAO_PASS_GENERATE_Q3] = buildLayout({
-    { B_SRV_LOAD_COUNTER,          VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-    { B_SRV_DEINTERLEAVED_DEPTHS,  VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-    { B_SRV_DEINTERLEAVED_NORMALS, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-    { B_SRV_SSAO_PING,             VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-    { B_SRV_IMPORTANCE_MAP,        VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-    { B_UAV_SSAO_PING,             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-  });
+  // PASS_GENERATE_Qx — all four generate variants (q0/q1/q2/q3 SPIR-V) share
+  // the exact same descriptor interface (bindings 0-4 + UAV 2000 verified via
+  // spirv-dis), so each pass gets its own identical layout object (separate
+  // handles: the destructor destroys every slot).
+  {
+    std::vector<BindDef> genDefs = {
+      { B_SRV_LOAD_COUNTER,          VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+      { B_SRV_DEINTERLEAVED_DEPTHS,  VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+      { B_SRV_DEINTERLEAVED_NORMALS, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+      { B_SRV_SSAO_PING,             VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+      { B_SRV_IMPORTANCE_MAP,        VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+      { B_UAV_SSAO_PING,             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
+    };
+    m_setLayouts[CACAO_PASS_GENERATE_Q3] = buildLayout(genDefs);
+    m_setLayouts[CACAO_PASS_GENERATE_Q0] = buildLayout(genDefs);
+    m_setLayouts[CACAO_PASS_GENERATE_Q1] = buildLayout(genDefs);
+    m_setLayouts[CACAO_PASS_GENERATE_Q2] = buildLayout(genDefs);
+  }
 
   // PASS_IMPORTANCE_MAP — full bindings used by all three importance-map passes.
   // Create SEPARATE layout objects for A and B to avoid double-destroy in destructor.
@@ -408,6 +420,9 @@ void D3D9CacaoRenderer::InitPipelines() {
   MAKE_PIPELINE(CACAO_PASS_PREPARE_DEPTHS,    FFX_CACAO_PREPARE_NATIVE_DEPTHS_AND_MIPS_PASS_SPV);
   MAKE_PIPELINE(CACAO_PASS_PREPARE_NORMALS,   FFX_CACAO_PREPARE_NATIVE_NORMALS_PASS_SPV);
   MAKE_PIPELINE(CACAO_PASS_GENERATE_Q3,       FFX_CACAO_GENERATE_Q3_PASS_SPV);
+  MAKE_PIPELINE(CACAO_PASS_GENERATE_Q0,       FFX_CACAO_GENERATE_Q0_PASS_SPV);
+  MAKE_PIPELINE(CACAO_PASS_GENERATE_Q1,       FFX_CACAO_GENERATE_Q1_PASS_SPV);
+  MAKE_PIPELINE(CACAO_PASS_GENERATE_Q2,       FFX_CACAO_GENERATE_Q2_PASS_SPV);
   MAKE_PIPELINE(CACAO_PASS_IMPORTANCE_MAP,    FFX_CACAO_GENERATE_IMPORTANCE_MAP_PASS_SPV);
   MAKE_PIPELINE(CACAO_PASS_IMPORTANCE_MAP_A,  FFX_CACAO_GENERATE_IMPORTANCE_MAP_A_PASS_SPV);
   MAKE_PIPELINE(CACAO_PASS_IMPORTANCE_MAP_B,  FFX_CACAO_GENERATE_IMPORTANCE_MAP_B_PASS_SPV);
@@ -530,6 +545,53 @@ void D3D9CacaoRenderer::InitResources(uint32_t w, uint32_t h) {
     m_loadCounter = m_device->createImage(ici, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   }
 
+  // Cached static views: depend only on our own intermediates, so they are
+  // created once per resolution instead of ~15 times per Apply.
+  {
+    auto mkView = [](const Rc<DxvkImage>& img, VkFormat fmt, VkImageViewType type,
+                     VkImageUsageFlagBits usage, uint32_t layers,
+                     uint32_t baseMip = 0, uint32_t mipCnt = 1) {
+      DxvkImageViewKey key = {};
+      key.viewType   = type;
+      key.usage      = usage;
+      key.format     = fmt;
+      key.layout     = VK_IMAGE_LAYOUT_GENERAL;
+      key.aspects    = VK_IMAGE_ASPECT_COLOR_BIT;
+      key.mipIndex   = uint8_t(baseMip);
+      key.mipCount   = uint8_t(mipCnt);
+      key.layerIndex = 0u;
+      key.layerCount = uint16_t(layers);
+      return img->createView(key);
+    };
+
+    m_vDeintDUav = mkView(m_deinterleavedDepths, VK_FORMAT_R32_SFLOAT,
+      VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_USAGE_STORAGE_BIT, 4);
+    m_vDeintDSrv = mkView(m_deinterleavedDepths, VK_FORMAT_R32_SFLOAT,
+      VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_USAGE_SAMPLED_BIT, 4);
+    for (uint32_t m = 0; m < 4; m++)
+      m_vDeintDMips[m] = mkView(m_deinterleavedDepths, VK_FORMAT_R32_SFLOAT,
+        VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_USAGE_STORAGE_BIT, 4, m, 1);
+    m_vDeintNUav = mkView(m_deinterleavedNormals, VK_FORMAT_R32G32B32A32_SFLOAT,
+      VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_USAGE_STORAGE_BIT, 4);
+    m_vDeintNSrv = mkView(m_deinterleavedNormals, VK_FORMAT_R32G32B32A32_SFLOAT,
+      VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_USAGE_SAMPLED_BIT, 4);
+    m_vPingUav   = mkView(m_ssaoPing, VK_FORMAT_R32G32_SFLOAT,
+      VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_USAGE_STORAGE_BIT, 4);
+    m_vPingSrv   = mkView(m_ssaoPing, VK_FORMAT_R32G32_SFLOAT,
+      VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_USAGE_SAMPLED_BIT, 4);
+    m_vPongUav   = mkView(m_ssaoPong, VK_FORMAT_R32G32_SFLOAT,
+      VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_USAGE_STORAGE_BIT, 4);
+    m_vPongSrv   = mkView(m_ssaoPong, VK_FORMAT_R32G32_SFLOAT,
+      VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_USAGE_SAMPLED_BIT, 4);
+    m_vImpSrv    = mkView(m_importanceMap, VK_FORMAT_R32_SFLOAT,
+      VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_USAGE_SAMPLED_BIT, 1);
+    m_vLoadSrv   = mkView(m_loadCounter, VK_FORMAT_R32_UINT,
+      VK_IMAGE_VIEW_TYPE_1D, VK_IMAGE_USAGE_SAMPLED_BIT, 1);
+    for (uint32_t i = 0; i < kFrameLag; i++)
+      m_vAoUavs[i] = mkView(m_aoFinals[i], VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_USAGE_STORAGE_BIT, 1);
+  }
+
   // Constants UBO (double-buffered to avoid race conditions)
   DxvkBufferCreateInfo cbci = {};
   cbci.size   = sizeof(CacaoConstants);
@@ -564,10 +626,23 @@ void D3D9CacaoRenderer::DestroyResources() {
   m_ssaoPong             = nullptr;
   m_importanceMap        = nullptr;
   m_importanceMapPong    = nullptr;
-  m_aoFinalSrvs[0]     = nullptr;
-  m_aoFinalSrvs[1]     = nullptr;
-  m_aoFinals[0]        = nullptr;
-  m_aoFinals[1]        = nullptr;
+  m_vDeintDUav = nullptr;
+  m_vDeintDSrv = nullptr;
+  m_vDeintNUav = nullptr;
+  m_vDeintNSrv = nullptr;
+  for (uint32_t m = 0; m < 4; m++)
+    m_vDeintDMips[m] = nullptr;
+  m_vPingSrv = nullptr;
+  m_vPingUav = nullptr;
+  m_vPongSrv = nullptr;
+  m_vPongUav = nullptr;
+  m_vImpSrv  = nullptr;
+  m_vLoadSrv = nullptr;
+  for (uint32_t i = 0; i < kFrameLag; i++) {
+    m_aoFinalSrvs[i] = nullptr;
+    m_vAoUavs[i]     = nullptr;
+    m_aoFinals[i]    = nullptr;
+  }
   m_loadCounter          = nullptr;
   for (uint32_t i = 0; i < kFrameLag; i++) {
     m_constantBuffers[i] = nullptr;
@@ -621,6 +696,18 @@ void D3D9CacaoRenderer::UpdateConstants(
   float       depthLinearizeAdd =  proj[10];
   if (depthLinearizeMul * depthLinearizeAdd < 0.0f)
     depthLinearizeAdd = -depthLinearizeAdd;
+  // D3D9 depth convention: 0 = near, 1 = far. DXVK stores the raw D3D9 depth
+  // unmodified (no reversed-depth viewport for D3D9 — verified: no min/maxDepth
+  // flip in d3d9 viewport setup, and Clear writes 1.0 = far). viewZ(d) =
+  // mul / (add - d) with mul = near*far/(far-near), add = far/(far-near).
+  //
+  // HISTORY (don't re-flip): a 06.09 build flipped these constants believing
+  // DXVK stores D3D9 depth reversed ("empty gave viewZ=near"). That observation
+  // came from an uninitialized buffer. The 29.10 full-buffer dump proved it
+  // wrong: a REAL scene read raw depth 0.995 uniformly (= viewZ ~1900 units,
+  // the login backdrop) — with the flipped constants that scene was unpacked
+  // to viewZ ~10 (at the near plane), normals became garbage, SSAO ~0 and the
+  // composite went black on every frame that had real depth content.
   c->DepthUnpackConsts[0] = depthLinearizeMul;
   c->DepthUnpackConsts[1] = depthLinearizeAdd;
 
@@ -804,7 +891,7 @@ void D3D9CacaoRenderer::WriteDumpFiles(uint32_t slot) {
   // 1) aoFinal: RGBA16F, R = visibility
   {
     std::vector<uint8_t> px(size_t(m_width) * m_height);
-    const uint16_t* src = reinterpret_cast<const uint16_t*>(base);
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(base + 9u * 1024u * 1024u);
     for (uint32_t i = 0; i < px.size(); i++)
       px[i] = uint8_t(dxvk::clamp(half2f(src[i * 4 + 0]), 0.0f, 1.0f) * 255.0f);
     char name[64];
@@ -815,7 +902,7 @@ void D3D9CacaoRenderer::WriteDumpFiles(uint32_t slot) {
   // 2) deinterleaved depth layer 0: R32F viewZ, log scale
   {
     std::vector<uint8_t> px(size_t(bsi.deinterleavedDepthBufferWidth) * bsi.deinterleavedDepthBufferHeight);
-    const float* src = reinterpret_cast<const float*>(base + 16u * 1024u * 1024u);
+    const float* src = reinterpret_cast<const float*>(base + 1u * 1024u * 1024u);
     const float maxZ = 30000.0f, invLog = 1.0f / std::log(1.0f + maxZ);
     for (uint32_t i = 0; i < px.size(); i++) {
       float z = src[i] < 0.0f ? 0.0f : src[i];
@@ -829,7 +916,7 @@ void D3D9CacaoRenderer::WriteDumpFiles(uint32_t slot) {
   // 3) blurred SSAO layer 0: RG32F (R = visibility, G = packed edges)
   {
     std::vector<uint8_t> px(size_t(bsi.ssaoBufferWidth) * bsi.ssaoBufferHeight);
-    const float* src = reinterpret_cast<const float*>(base + 19u * 1024u * 1024u);
+    const float* src = reinterpret_cast<const float*>(base + 4u * 1024u * 1024u);
     for (uint32_t i = 0; i < px.size(); i++)
       px[i] = uint8_t(dxvk::clamp(src[i * 2 + 0], 0.0f, 1.0f) * 255.0f);
     char name[64];
@@ -882,6 +969,9 @@ void D3D9CacaoRenderer::Apply(
     std::memcpy(&viewDepth, base + 0, 4);
     std::memcpy(&ssaoR,     base + 16, 4);
     std::memcpy(&ssaoG,     base + 20, 4);
+    uint32_t snapRaw = 0;
+    std::memcpy(&snapRaw,   base + 32, 4);
+    float snapD = float(snapRaw & 0xFFFFFF) / 16777215.0f;
 
     const uint16_t* strip = reinterpret_cast<const uint16_t*>(base + 64);
     float aoMin = 1e9f, aoMax = -1e9f;
@@ -892,12 +982,18 @@ void D3D9CacaoRenderer::Apply(
     }
     CacaoLogger::get().log(str::format(
       "[READBACK] viewZ=", viewDepth, " ssao=(", ssaoR, ", ", ssaoG, ")",
+      " snapD=", snapD, " (0x", std::hex, snapRaw, std::dec, ")",
       " aoStrip[min=", aoMin, " max=", aoMax, "]",
       " first4=", half2float(strip[0]), ",", half2float(strip[4]), ",",
       half2float(strip[8]), ",", half2float(strip[12])));
   }
 
   m_applyCount++;
+
+  bool useSnapInput = depthImage.ptr() == m_depthCopy.ptr();
+  if (m_applyCount % 60 == 0)
+    CacaoLogger::get().log(str::format("[SRC] snapInput=", useSnapInput,
+      " depthImg=", depthImage.ptr(), " snap=", m_depthCopy.ptr()));
 
   bool dumpEnabled = m_dumpEnabled && m_readbackBuffer != nullptr;
 
@@ -907,8 +1003,14 @@ void D3D9CacaoRenderer::Apply(
     WriteDumpFiles(m_dumpWriteSlot);
   }
 
-  // Issue a new dump when enabled (alternates A/B slots)
-  if (dumpEnabled && !m_dumpWritePending && m_applyCount >= m_dumpWriteAt) {
+  // Issue a new dump when enabled (alternates A/B slots), throttled because
+  // the full-buffer GPU copy and the host-side PGM write are expensive.
+  bool doDump = false;
+  if (dumpEnabled && !m_dumpWritePending && m_applyCount >= m_dumpWriteAt
+   && std::chrono::steady_clock::now() - m_dumpLastIssue >= kDumpMinInterval) {
+    doDump             = true;
+    m_dumpLastIssue    = std::chrono::steady_clock::now();
+    m_probeBurst       = 12;
     m_dumpWritePending = true;
     m_dumpWriteAt      = m_applyCount + kFrameLag;
     m_dumpWriteSlot    = m_dumpSlot;
@@ -971,6 +1073,19 @@ void D3D9CacaoRenderer::Apply(
   Rc<DxvkImage>  impMap    = m_importanceMap;
   Rc<DxvkImage>  impMapP   = m_importanceMapPong;
   Rc<DxvkImage>  aoFinal   = m_aoFinals[m_frameIndex];  // Frame-specific AO buffer
+  Rc<DxvkImageView> aoUavView = m_vAoUavs[m_frameIndex];
+
+  Rc<DxvkImageView> vDeintDUav = m_vDeintDUav;
+  Rc<DxvkImageView> vDeintDSrv = m_vDeintDSrv;
+  Rc<DxvkImageView> vDeintNUav = m_vDeintNUav;
+  Rc<DxvkImageView> vDeintNSrv = m_vDeintNSrv;
+  std::array<Rc<DxvkImageView>, 4> vDeintDMips = m_vDeintDMips;
+  Rc<DxvkImageView> vPingSrv = m_vPingSrv;
+  Rc<DxvkImageView> vPingUav = m_vPingUav;
+  Rc<DxvkImageView> vPongSrv = m_vPongSrv;
+  Rc<DxvkImageView> vPongUav = m_vPongUav;
+  Rc<DxvkImageView> vImpSrv  = m_vImpSrv;
+  Rc<DxvkImageView> vLoadSrv = m_vLoadSrv;
   Rc<DxvkImage>  loadCnt   = m_loadCounter;
   Rc<DxvkBuffer> cb        = m_constantBuffers[m_frameIndex];  // Frame-specific constant buffer
   Rc<DxvkImage>  depthCopy = m_depthCopy;  // Capture for depth copy target
@@ -1012,20 +1127,28 @@ void D3D9CacaoRenderer::Apply(
   BufSizeInfo bsiCopy = bsi;
   CacaoQuality quality = m_quality;
 
-  // Decide whether to issue a readback this frame
+  // Decide whether to issue a readback this frame. The dump needs the
+  // staging buffer too, but the full-buffer copy must not run every apply
+  // (25 MB over PCIe per present was a major FPS loss).
   m_readbackFrameCount++;
-  bool doReadback = ((m_readbackFrameCount % kReadbackInterval == 0) || dumpEnabled) && m_readbackBuffer;
-  Rc<DxvkBuffer> readbackBuf = doReadback ? m_readbackBuffer : nullptr;
+  bool burst = m_probeBurst > 0;
+  if (burst)
+    m_probeBurst--;
+  bool doReadback = ((m_readbackFrameCount % kReadbackInterval == 0) || burst) && m_readbackBuffer;
+  bool needStaging = (doReadback || doDump) && m_readbackBuffer;
+  Rc<DxvkBuffer> readbackBuf = needStaging ? m_readbackBuffer : nullptr;
   if (doReadback)
     m_readbackPending = true;
 
   device->EmitCs([
     vkd, depthImage = std::move(depthImage), depthCopy,
-    deintD, deintN, ssaoPing, ssaoPong, impMap, impMapP, aoFinal, loadCnt, cb,
+    deintD, deintN, ssaoPing, ssaoPong, impMap, impMapP, aoFinal, aoUavView, loadCnt, cb,
     pipelines, pipeLayouts,
+    vDeintDUav, vDeintDSrv, vDeintNUav, vDeintNSrv, vDeintDMips,
+    vPingSrv, vPingUav, vPongSrv, vPongUav, vImpSrv, vLoadSrv,
     frameSets /* copied by value (array of VkDescriptorSet handles) */,
     w, h, bsiCopy, quality, debugFill,
-    readbackBuf, dumpEnabled
+    readbackBuf, doReadback, doDump, useSnapInput
   ] (DxvkContext* cs) mutable {
 
     cs->beginExternalRendering();
@@ -1125,12 +1248,6 @@ void D3D9CacaoRenderer::Apply(
     cbInfo.offset = cb->getSliceInfo().offset;
     cbInfo.range  = sizeof(CacaoConstants);
 
-    const VkFormat fmtDeintD = VK_FORMAT_R32_SFLOAT;
-    const VkFormat fmtDeintN = VK_FORMAT_R32G32B32A32_SFLOAT;
-    const VkFormat fmtSsao   = VK_FORMAT_R32G32_SFLOAT;
-    const VkFormat fmtLoad   = VK_FORMAT_R32_UINT;
-    const VkFormat fmtAo     = VK_FORMAT_R16G16B16A16_SFLOAT;
-
     constexpr uint32_t TG = 8;
 
     // ── Debug fill: skip CACAO, write 0.5 to aoFinal to test composite ─────
@@ -1217,34 +1334,28 @@ void D3D9CacaoRenderer::Apply(
     // Use original depth image format for shader sampling
     const VkFormat fmtDepthSrv = depthImage->info().format;
 
+    // Depth SRV shared by PASS 1 and PASS 2 (created once per Apply)
+    auto depthSrv = makeView(depthImage, fmtDepthSrv, VK_IMAGE_VIEW_TYPE_2D,
+      VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_LAYOUT_GENERAL,
+      0, 1, 0, 1, VK_IMAGE_ASPECT_DEPTH_BIT);
+
     // ════════════════════════════════════════════════════════════════════════
     // PASS 1 — Prepare native depths and mips
     // ════════════════════════════════════════════════════════════════════════
     {
       VkDescriptorSet ds = frameSets[SET_IDX_DEPTHS];
 
-      // depth SRV from original depth image (DEPTH aspect, GENERAL layout)
-      auto depthSrv = makeView(depthImage, fmtDepthSrv, VK_IMAGE_VIEW_TYPE_2D,
-        VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_LAYOUT_GENERAL,
-        0, 1, 0, 1, VK_IMAGE_ASPECT_DEPTH_BIT);
       VkDescriptorImageInfo depthSrvInfo = { {}, depthSrv->handle(), VK_IMAGE_LAYOUT_GENERAL };
       imgWrite(ds, B_SRV_DEPTH_IN, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, depthSrvInfo);
 
-      // deinterleaved depths array UAV (all 4 layers, mip 0)
-      auto deintDUav = makeView(deintD, fmtDeintD, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-        VK_IMAGE_USAGE_STORAGE_BIT, VK_IMAGE_LAYOUT_GENERAL, 0, 4);
-      VkDescriptorImageInfo deintDUavInfo = { {}, deintDUav->handle(), VK_IMAGE_LAYOUT_GENERAL };
+      VkDescriptorImageInfo deintDUavInfo = { {}, vDeintDUav->handle(), VK_IMAGE_LAYOUT_GENERAL };
       imgWrite(ds, B_UAV_DEINT_DEPTHS, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, deintDUavInfo);
 
       // depth mips UAV: 4 array elements, one per mip level
       // (descriptor array binding with count=4, each element = one mip view)
-      std::array<Rc<DxvkImageView>, 4> mipViews;
       std::array<VkDescriptorImageInfo, 4> mipInfos = {};
-      for (uint32_t m = 0; m < 4; m++) {
-        mipViews[m] = makeView(deintD, fmtDeintD, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-          VK_IMAGE_USAGE_STORAGE_BIT, VK_IMAGE_LAYOUT_GENERAL, 0, 4, m, 1);
-        mipInfos[m] = { {}, mipViews[m]->handle(), VK_IMAGE_LAYOUT_GENERAL };
-      }
+      for (uint32_t m = 0; m < 4; m++)
+        mipInfos[m] = { {}, vDeintDMips[m]->handle(), VK_IMAGE_LAYOUT_GENERAL };
       VkWriteDescriptorSet mipWrite = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
       mipWrite.dstSet          = ds;
       mipWrite.dstBinding      = B_UAV_DEPTH_MIPS;
@@ -1278,15 +1389,10 @@ void D3D9CacaoRenderer::Apply(
       VkDescriptorSet ds = frameSets[SET_IDX_NORMALS];
 
       // Use original depth image for normals computation (GENERAL layout)
-      auto depthSrv = makeView(depthImage, fmtDepthSrv, VK_IMAGE_VIEW_TYPE_2D,
-        VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_LAYOUT_GENERAL,
-        0, 1, 0, 1, VK_IMAGE_ASPECT_DEPTH_BIT);
       VkDescriptorImageInfo depthSrvInfo = { {}, depthSrv->handle(), VK_IMAGE_LAYOUT_GENERAL };
       imgWrite(ds, B_SRV_DEPTH_IN, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, depthSrvInfo);
 
-      auto deintNUav = makeView(deintN, fmtDeintN, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-        VK_IMAGE_USAGE_STORAGE_BIT, VK_IMAGE_LAYOUT_GENERAL, 0, 4);
-      VkDescriptorImageInfo deintNUavInfo = { {}, deintNUav->handle(), VK_IMAGE_LAYOUT_GENERAL };
+      VkDescriptorImageInfo deintNUavInfo = { {}, vDeintNUav->handle(), VK_IMAGE_LAYOUT_GENERAL };
       imgWrite(ds, B_UAV_DEINT_NORMALS, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, deintNUavInfo);
 
       bufWrite(ds, B_CB_CACAO, cbInfo);
@@ -1308,32 +1414,36 @@ void D3D9CacaoRenderer::Apply(
     computeBarrier();
 
     // ════════════════════════════════════════════════════════════════════════
-    // PASS 3 — Generate Q3 AO (z=4: all 4 deinterleaved layers at once)
+    // PASS 3 — Generate AO (z=4: all 4 deinterleaved layers at once)
     //          Reads: deintD (SRV), deintN (SRV), ssaoPong (SRV, unused in non-adaptive)
     //          Writes: ssaoPing (UAV)
+    //
+    //          Pipeline is selected per quality level. The q3 SPIR-V is the
+    //          ADAPTIVE variant: its non-adaptive branch is skipped at runtime
+    //          (qualityLevel==3), and the adaptive branch reads the "base pass"
+    //          via LoadBasePassSSAOPass from the pong buffer. This port never
+    //          runs the q3 base/importance passes, so pong holds the previous
+    //          frame's blur intermediate — a temporal feedback loop that made
+    //          the output oscillate (period-2 flicker). The q0/q1/q2 variants
+    //          contain the same adaptive code but with a compile-time-dead
+    //          branch (verified in SPIR-V), so they are fully deterministic.
+    //          Until the full adaptive pipeline is ported, Medium and High both
+    //          use the q2 non-adaptive variant.
     // ════════════════════════════════════════════════════════════════════════
     {
+      const CacaoPass generatePass =
+          quality == CacaoQuality::Lowest ? CACAO_PASS_GENERATE_Q0
+        : quality == CacaoQuality::Low    ? CACAO_PASS_GENERATE_Q1
+        :                                   CACAO_PASS_GENERATE_Q2;
+
       VkDescriptorSet ds = frameSets[SET_IDX_Q3];
 
-      auto deintDSrv  = makeView(deintD,  fmtDeintD, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-        VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_LAYOUT_GENERAL, 0, 4);
-      auto deintNSrv  = makeView(deintN,  fmtDeintN, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-        VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_LAYOUT_GENERAL, 0, 4);
-      auto pingUav    = makeView(ssaoPing, fmtSsao, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-        VK_IMAGE_USAGE_STORAGE_BIT, VK_IMAGE_LAYOUT_GENERAL, 0, 4);
-      auto pongSrv    = makeView(ssaoPong, fmtSsao, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-        VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_LAYOUT_GENERAL, 0, 4);
-      auto impSrv     = makeView(impMap,  VK_FORMAT_R32_SFLOAT, VK_IMAGE_VIEW_TYPE_2D,
-        VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_LAYOUT_GENERAL, 0, 1);
-      auto loadSrv    = makeView(loadCnt, fmtLoad, VK_IMAGE_VIEW_TYPE_1D,
-        VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_LAYOUT_GENERAL, 0, 1);
-
-      VkDescriptorImageInfo deintDInfo  = { {}, deintDSrv->handle(),  VK_IMAGE_LAYOUT_GENERAL };
-      VkDescriptorImageInfo deintNInfo  = { {}, deintNSrv->handle(),  VK_IMAGE_LAYOUT_GENERAL };
-      VkDescriptorImageInfo pingUavInfo = { {}, pingUav->handle(),    VK_IMAGE_LAYOUT_GENERAL };
-      VkDescriptorImageInfo pongSrvInfo = { {}, pongSrv->handle(),    VK_IMAGE_LAYOUT_GENERAL };
-      VkDescriptorImageInfo impInfo     = { {}, impSrv->handle(),     VK_IMAGE_LAYOUT_GENERAL };
-      VkDescriptorImageInfo loadInfo    = { {}, loadSrv->handle(),    VK_IMAGE_LAYOUT_GENERAL };
+      VkDescriptorImageInfo deintDInfo  = { {}, vDeintDSrv->handle(),  VK_IMAGE_LAYOUT_GENERAL };
+      VkDescriptorImageInfo deintNInfo  = { {}, vDeintNSrv->handle(),  VK_IMAGE_LAYOUT_GENERAL };
+      VkDescriptorImageInfo pingUavInfo = { {}, vPingUav->handle(),    VK_IMAGE_LAYOUT_GENERAL };
+      VkDescriptorImageInfo pongSrvInfo = { {}, vPongSrv->handle(),    VK_IMAGE_LAYOUT_GENERAL };
+      VkDescriptorImageInfo impInfo     = { {}, vImpSrv->handle(),     VK_IMAGE_LAYOUT_GENERAL };
+      VkDescriptorImageInfo loadInfo    = { {}, vLoadSrv->handle(),    VK_IMAGE_LAYOUT_GENERAL };
 
       imgWrite(ds, B_SRV_LOAD_COUNTER,          VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  loadInfo);
       imgWrite(ds, B_SRV_DEINTERLEAVED_DEPTHS,  VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  deintDInfo);
@@ -1344,10 +1454,10 @@ void D3D9CacaoRenderer::Apply(
       bufWrite(ds, B_CB_CACAO, cbInfo);
 
       cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
-        VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[CACAO_PASS_GENERATE_Q3]);
+        VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[generatePass]);
       VkBindDescriptorSetsInfo bindInfo = { VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO };
       bindInfo.stageFlags          = VK_SHADER_STAGE_COMPUTE_BIT;
-      bindInfo.layout            = pipeLayouts[CACAO_PASS_GENERATE_Q3];
+      bindInfo.layout            = pipeLayouts[generatePass];
       bindInfo.firstSet          = 0;
       bindInfo.descriptorSetCount = 1;
       bindInfo.pDescriptorSets   = &ds;
@@ -1371,10 +1481,8 @@ void D3D9CacaoRenderer::Apply(
 
       VkDescriptorSet ds = frameSets[SET_IDX_BLUR_0 + blurPass];
 
-      auto srcView = makeView(src, fmtSsao, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-        VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_LAYOUT_GENERAL, 0, 4);
-      auto dstView = makeView(dst, fmtSsao, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-        VK_IMAGE_USAGE_STORAGE_BIT, VK_IMAGE_LAYOUT_GENERAL, 0, 4);
+      const Rc<DxvkImageView>& srcView = even ? vPingSrv : vPongSrv;
+      const Rc<DxvkImageView>& dstView = even ? vPongUav : vPingUav;
 
       VkDescriptorImageInfo srcInfo = { {}, srcView->handle(), VK_IMAGE_LAYOUT_GENERAL };
       VkDescriptorImageInfo dstInfo = { {}, dstView->handle(), VK_IMAGE_LAYOUT_GENERAL };
@@ -1407,18 +1515,18 @@ void D3D9CacaoRenderer::Apply(
     // Compositing is done in the present blitter via binding=4 / c_composite_ao=true.
     // ════════════════════════════════════════════════════════════════════════
     {
-      // After blur, finalSsao is in ssaoPong (if numBlurPasses even) or ssaoPing (if odd)
-      Rc<DxvkImage>& finalSsao = (numBlurPasses % 2 == 0) ? ssaoPong : ssaoPing;
+      // After the blur loop the result sits in the buffer written by the
+      // LAST blur pass: generate wrote ssaoPing, each pass swaps dst, so
+      // after an even pass count the result is back in ssaoPing. Reading
+      // the wrong buffer (a previous intermediate) fed stale AO into the
+      // composite and oscillated through the Q3 temporal history.
+      Rc<DxvkImage>& finalSsao = (numBlurPasses % 2 == 0) ? ssaoPing : ssaoPong;
+      const Rc<DxvkImageView>& ssaoSrv = (numBlurPasses % 2 == 0) ? vPingSrv : vPongSrv;
 
       VkDescriptorSet ds = frameSets[SET_IDX_APPLY];
 
-      auto ssaoSrv = makeView(finalSsao, fmtSsao, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-        VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_LAYOUT_GENERAL, 0, 4);
-      auto aoUav   = makeView(aoFinal, fmtAo, VK_IMAGE_VIEW_TYPE_2D,
-        VK_IMAGE_USAGE_STORAGE_BIT, VK_IMAGE_LAYOUT_GENERAL, 0, 1);
-
       VkDescriptorImageInfo ssaoSrvInfo = { {}, ssaoSrv->handle(), VK_IMAGE_LAYOUT_GENERAL };
-      VkDescriptorImageInfo aoUavInfo   = { {}, aoUav->handle(),   VK_IMAGE_LAYOUT_GENERAL };
+      VkDescriptorImageInfo aoUavInfo   = { {}, aoUavView->handle(), VK_IMAGE_LAYOUT_GENERAL };
 
       imgWrite(ds, B_SRV_SSAO_PING_APPLY, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  ssaoSrvInfo);
       imgWrite(ds, B_UAV_OUTPUT,          VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  aoUavInfo);
@@ -1463,9 +1571,9 @@ void D3D9CacaoRenderer::Apply(
     //                [16..23] ssao    layer0 center pixel (R32G32F, blurred AO)
     //                [64..575] aoFinal center strip 64x1 (RGBA16F, 8 B/px)
     if (readbackBuf) {
-      Rc<DxvkImage> finalSsao = (numBlurPasses % 2 == 0) ? ssaoPong : ssaoPing;
+      Rc<DxvkImage> finalSsao = (numBlurPasses % 2 == 0) ? ssaoPing : ssaoPong;
 
-      auto transferReadBarrier = [&](const Rc<DxvkImage>& img) {
+      auto transferReadBarrier = [&](const Rc<DxvkImage>& img, VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
         VkImageMemoryBarrier2 rb = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
         rb.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
                          | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
@@ -1486,6 +1594,8 @@ void D3D9CacaoRenderer::Apply(
       transferReadBarrier(deintD);
       transferReadBarrier(finalSsao);
       transferReadBarrier(aoFinal);
+      if (useSnapInput)
+        transferReadBarrier(depthCopy, VK_IMAGE_ASPECT_DEPTH_BIT);
 
       VkDeviceSize bufBase = readbackBuf->getSliceInfo().offset;
       VkBuffer dstBuf      = readbackBuf->getSliceInfo().buffer;
@@ -1510,28 +1620,35 @@ void D3D9CacaoRenderer::Apply(
       };
 
       // 1) deinterleaved depth, layer 0, mip 0, center pixel
-      copyRegion(0,  deintD,     VK_IMAGE_ASPECT_COLOR_BIT,
-                 int32_t(bsiCopy.deinterleavedDepthBufferWidth  / 2),
-                 int32_t(bsiCopy.deinterleavedDepthBufferHeight / 2), 1, 1);
-      // 2) blurred SSAO (final half-res buffer), layer 0, center pixel
-      copyRegion(16, finalSsao,  VK_IMAGE_ASPECT_COLOR_BIT,
-                 int32_t(bsiCopy.ssaoBufferWidth  / 2),
-                 int32_t(bsiCopy.ssaoBufferHeight / 2), 1, 1);
-      // 3) aoFinal strip 64x1 from the vertical center
-      copyRegion(64, aoFinal,    VK_IMAGE_ASPECT_COLOR_BIT,
-                 int32_t(w / 2) - 32, int32_t(h / 2), 64, 1);
+      if (doReadback) {
+        copyRegion(0,  deintD,     VK_IMAGE_ASPECT_COLOR_BIT,
+                   int32_t(bsiCopy.deinterleavedDepthBufferWidth  / 2),
+                   int32_t(bsiCopy.deinterleavedDepthBufferHeight / 2), 1, 1);
+        // 2) blurred SSAO (final half-res buffer), layer 0, center pixel
+        copyRegion(16, finalSsao,  VK_IMAGE_ASPECT_COLOR_BIT,
+                   int32_t(bsiCopy.ssaoBufferWidth  / 2),
+                   int32_t(bsiCopy.ssaoBufferHeight / 2), 1, 1);
+        // 3) aoFinal strip 64x1 from the vertical center
+        copyRegion(64, aoFinal,    VK_IMAGE_ASPECT_COLOR_BIT,
+                   int32_t(w / 2) - 32, int32_t(h / 2), 64, 1);
+        // 4) snapshot depth center pixel (raw depth-aspect value)
+        if (useSnapInput)
+          copyRegion(32, depthCopy,  VK_IMAGE_ASPECT_DEPTH_BIT,
+                     int32_t(w / 2), int32_t(h / 2), 1, 1);
+      }
 
-      // 4) Full-buffer dump (rotating A/B) when enabled in config
-      if (dumpEnabled) {
-        // aoFinal, full extent
-        copyRegion(0u * 1024u * 1024u, aoFinal,   VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, w, h);
+      // 4) Full-buffer dump (rotating A/B) when enabled in config.
+      //    Regions must not overlap the strip area at [0..576].
+      if (doDump) {
         // deinterleaved depth, layer 0, mip 0
-        copyRegion(16u * 1024u * 1024u, deintD,   VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+        copyRegion(1u * 1024u * 1024u,  deintD,    VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
                    bsiCopy.deinterleavedDepthBufferWidth,
                    bsiCopy.deinterleavedDepthBufferHeight);
-        // pre-blur... post-blur SSAO, layer 0
-        copyRegion(19u * 1024u * 1024u, finalSsao, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+        // post-blur SSAO, layer 0
+        copyRegion(4u * 1024u * 1024u,  finalSsao, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
                    bsiCopy.ssaoBufferWidth, bsiCopy.ssaoBufferHeight);
+        // aoFinal, full extent
+        copyRegion(9u * 1024u * 1024u,  aoFinal,   VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, w, h);
       }
 
       cmd->track(readbackBuf, DxvkAccess::Write);

@@ -1594,6 +1594,30 @@ namespace dxvk {
     int32_t                         m_cacaoHotkey      = 0;
     bool                            m_prevHotkeyState  = false;
     Rc<DxvkImage>                   m_cacaoLastDepthImg;
+    // Depth buffer of the main scene pass. Armed by an on-aspect perspective
+    // SetTransform(PROJECTION); the next same-extent depth bind captures it.
+    // UI/ortho and water/square projections disarm, so their depth buffers
+    // are never captured (L2 renders flash UI with its own depth last).
+    Rc<DxvkImage>                   m_cacaoSceneDepthImg;
+    bool                            m_cacaoSceneDepthArmed = false;
+    // Counts aspect-correct perspective SetTransform(PROJECTION) calls: UE2
+    // re-sets the world projection every game frame, so an unchanged count
+    // means a repeated Present of the same frame (post-UI) whose depth state
+    // may be cleared/polluted - running the chain there caused flicker.
+    uint32_t                        m_cacaoProjSetCount    = 0;
+    uint32_t                        m_cacaoAppliedProjCount = 0;
+    // Set by ApplyCACAOAtWorldEnd (the first non-world SetTransform after a
+    // present), cleared by the next Present. UE2 sets its world projection
+    // twice per frame with bit-different matrices, so a per-frame boolean or
+    // a memcmp change-gate both re-armed a second chain run; "no chain since
+    // the last present" is the only reliable once-per-frame barrier.
+    bool                            m_cacaoChainSincePresent = false;
+    bool                            m_cacaoHaveAO            = false;
+    // Which SetTransform branch triggered the current chain attempt:
+    // 1 = off-aspect perspective rejection (water-type), 2 = ortho (UI).
+    uint32_t                        m_cacaoChainSignal       = 0;
+    void                            TryCaptureCacaoSceneDepth();
+    void                            ApplyCACAOAtWorldEnd();
     // Single-sample resolve target for MSAA depth buffers.
     // Recreated whenever the depth image dimensions/format change.
     Rc<DxvkImage>                   m_cacaoDepthResolved;
@@ -1607,6 +1631,10 @@ namespace dxvk {
     bool                            m_cacaoProjFromVS  = false;
     uint32_t                        m_cacaoLastWidth   = 0;     // For UE2 fallback projection
     uint32_t                        m_cacaoLastHeight  = 0;
+    // Backbuffer/swapchain extent (stable across sub-passes, unlike the
+    // per-draw render target extent used by m_cacaoLastWidth/Height).
+    uint32_t                        m_cacaoSwapWidth   = 0;
+    uint32_t                        m_cacaoSwapHeight  = 0;
 
     D3D9FFShaderModuleSet           m_ffModules;
     D3D9SWVPEmulator                m_swvpEmulator;
