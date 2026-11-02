@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <chrono>
 #ifdef MSC_VER
 #pragma fenv_access (on)
 #endif
@@ -1849,8 +1850,11 @@ namespace dxvk {
       }
     }
 
-    if (ds != nullptr)
+    if (ds != nullptr) {
       m_cacaoLastDepthImg = ds->GetCommonTexture()->GetImage();
+      if (m_cacaoSceneDepthArmed)
+        TryCaptureCacaoSceneDepth();
+    }
 
     m_state.depthStencil = ds;
 
@@ -4721,21 +4725,38 @@ namespace dxvk {
       // main scene depth unprojection corrupts the AO every frame (flicker).
       if (m[3][2] != 0.0f && !m_cacaoProjFromVS) {
         bool aspectOk = true;
-        if (m_cacaoLastWidth > 0 && m_cacaoLastHeight > 0 && m[0][0] != 0.0f) {
-          float matAspect  = m[1][1] / m[0][0];
-          float backAspect = float(m_cacaoLastHeight) / float(m_cacaoLastWidth);
-          aspectOk = std::abs(matAspect - backAspect) < 0.15f * backAspect;
+        if (m[0][0] != 0.0f) {
+          uint32_t refW = m_cacaoSwapWidth  ? m_cacaoSwapWidth  : m_cacaoLastWidth;
+          uint32_t refH = m_cacaoSwapHeight ? m_cacaoSwapHeight : m_cacaoLastHeight;
+          if (refW > 0 && refH > 0) {
+            float matAspect  = m[1][1] / m[0][0];
+            float backAspect = float(refW) / float(refH);
+            aspectOk = std::abs(matAspect - backAspect) < 0.15f * backAspect;
+          }
         }
         if (aspectOk) {
-          bool changed = std::memcmp(&m_cacaoLastProj, &m, sizeof(Matrix4)) != 0;
-          if (!m_cacaoHasValidProj || changed) {
-            m_cacaoLastProj    = m;
-            m_cacaoHasValidProj = true;
-            CacaoLogger::get().log(str::format(
-              "[PROJ-CACHE] Cached projection matrix from SetTransform: [",
-              m[0][0], ", ", m[1][1], ", ", m[2][2], ", ", m[3][2], "]"));
+          // Cache the projection only during the FIRST world pass of the
+          // frame (before the world-end chain ran). UE2 sets a second,
+          // bit-different perspective later in the frame (reflection pass);
+          // caching both made the shader constants alternate per frame and
+          // the AO oscillate between two states with identical depth.
+          if (!m_cacaoChainSincePresent) {
+            bool changed = std::memcmp(&m_cacaoLastProj, &m, sizeof(Matrix4)) != 0;
+            if (!m_cacaoHasValidProj || changed) {
+              m_cacaoLastProj    = m;
+              m_cacaoHasValidProj = true;
+              CacaoLogger::get().log(str::format(
+                "[PROJ-CACHE] Cached projection matrix from SetTransform: [",
+                m[0][0], ", ", m[1][1], ", ", m[2][2], ", ", m[3][2], "]"));
+            }
+            m_cacaoSceneDepthArmed = true;
+            TryCaptureCacaoSceneDepth();
           }
+          m_cacaoProjSetCount++;
         } else {
+          m_cacaoSceneDepthArmed = false;
+          m_cacaoChainSignal = 1;
+          ApplyCACAOAtWorldEnd();
           // Log each distinct rejected matrix only once (water passes
           // rebind the square projection thousands of times per second).
           static Matrix4 s_lastRejected = {};
@@ -4748,6 +4769,10 @@ namespace dxvk {
               m[0][0], ", ", m[1][1], ", ", m[2][2], ", ", m[3][2], "]"));
           }
         }
+      } else if (!m_cacaoProjFromVS) {
+        m_cacaoSceneDepthArmed = false;
+        m_cacaoChainSignal = 2;
+        ApplyCACAOAtWorldEnd();
       }
     }
 
@@ -9554,38 +9579,38 @@ namespace dxvk {
   }
 
 
-  void D3D9DeviceEx::TryApplyCACAO(uint32_t width, uint32_t height) {
+  void D3D9DeviceEx::ApplyCACAOAtWorldEnd() {
     if (!m_cacao.IsInitialized() || !m_cacao.IsEnabled())
       return;
-
-    // Diagnostic: log every 300 frames whether Apply actually runs
-    static uint32_t s_frameCount = 0;
-    bool doLog = (++s_frameCount % 300 == 0);
-
-    // Use the last non-null depth image seen during rendering.
-    // Many D3D9 games call SetDepthStencilSurface(nullptr) before Present
-    // (e.g. for UI passes), so m_state.depthStencil is null at present time.
-    Rc<DxvkImage> depthImg = m_cacaoLastDepthImg;
-    if (depthImg == nullptr) {
-      if (doLog) CacaoLogger::get().log("[FRAME] TryApply: skip (no depth)");
+    if (m_cacaoChainSincePresent || !m_cacaoHasValidProj)
       return;
-    }
 
-    // Depth must cover the presented image, otherwise the screen-space
-    // AO does not align with the frame (e.g. a shadow-pass depth buffer
-    // was the last one bound). Skip such frames with a log trace.
-    if (uint32_t(depthImg->info().extent.width) != width
-     || uint32_t(depthImg->info().extent.height) != height) {
-      if (doLog) CacaoLogger::get().log(str::format(
-        "[FRAME] TryApply: skip (depth ", depthImg->info().extent.width, "x",
-        depthImg->info().extent.height, " != swap ", width, "x", height, ")"));
-      m_cacao.FillAoBuffer(this, 1.0f);
+    // The world pass has just finished (the first non-world projection was
+    // set), so the depth buffer is guaranteed to hold the world scene here.
+    // Running the chain at Present time instead read whatever the later
+    // water/UI passes left in the depth, which alternated between the scene
+    // and cleared states frame by frame (flicker, garbage AO).
+    Rc<DxvkImage> depthImg = m_cacaoSceneDepthImg
+      ? m_cacaoSceneDepthImg
+      : Rc<DxvkImage>(m_cacaoLastDepthImg);
+    if (depthImg == nullptr)
       return;
-    }
 
-    // If MSAA depth — resolve into single-sample via DXVK public API.
-    // EmitCs here is safe: Flush() was already called before TryApplyCACAO,
-    // so the render pass is closed and depth is fully written.
+    uint32_t refW = m_cacaoSwapWidth  ? m_cacaoSwapWidth  : m_cacaoLastWidth;
+    uint32_t refH = m_cacaoSwapHeight ? m_cacaoSwapHeight : m_cacaoLastHeight;
+    if (refW > 0
+     && (uint32_t(depthImg->info().extent.width)  != refW
+      || uint32_t(depthImg->info().extent.height) != refH))
+      return;
+
+    m_cacaoChainSincePresent = true;
+    m_cacaoHaveAO            = true;
+
+    static uint32_t s_chainLog = 0;
+    if (++s_chainLog % 60 == 0)
+      CacaoLogger::get().log(str::format("[CHAIN] signal=", m_cacaoChainSignal,
+        " depth=", depthImg.ptr()));
+
     if (depthImg->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
       const auto& di = depthImg->info();
       bool needNew = !m_cacaoDepthResolved
@@ -9613,7 +9638,6 @@ namespace dxvk {
         rci.tiling      = VK_IMAGE_TILING_OPTIMAL;
         m_cacaoDepthResolved = GetDXVKDevice()->createImage(
           rci, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (doLog) CacaoLogger::get().log("[FRAME] Created MSAA resolve target");
       }
 
       Rc<DxvkImage> src = depthImg;
@@ -9632,39 +9656,93 @@ namespace dxvk {
       depthImg = m_cacaoDepthResolved;
     }
 
-    // Use the cached projection matrix from SetTransform.
-    // Note: TryApplyCACAO is called during Present, when UE2 may have already
-    // reset the projection matrix to identity for the next frame.
-    // Therefore we rely on m_cacaoHasValidProj (cached matrix) instead of
-    // checking the current projection matrix.
-    // Advance frame index first to ensure consistent indexing.
     m_cacao.AdvanceFrameIndex();
+    m_cacao.Apply(this, depthImg, reinterpret_cast<const float*>(&m_cacaoLastProj),
+                  refW, refH, GetOptions()->cacaoDebugFill);
+  }
 
-    // Check if current frame has a valid depth buffer (UI frames have null depth)
-    if (m_state.depthStencil == nullptr) {
-      // UI frame: fill AO buffer with 1.0 (no occlusion)
-      m_cacao.FillAoBuffer(this, 1.0f);
-      if (doLog) CacaoLogger::get().log("[FRAME] TryApply: UI frame (no depth), filled AO=1.0");
+
+  void D3D9DeviceEx::TryCaptureCacaoSceneDepth() {
+    D3D9Surface* ds = m_state.depthStencil.ptr();
+    if (ds == nullptr)
+      return;
+
+    Rc<DxvkImage> img = ds->GetCommonTexture()->GetImage();
+    if (img == nullptr)
+      return;
+
+    // Filter against the SWAPCHAIN extent: m_cacaoLastWidth/Height track the
+    // current render target and shrink to reflection/shadow RT sizes, which
+    // made the capture flip-flop between the world depth and RT-local depth
+    // buffers (e.g. a 512x512 water reflection depth).
+    uint32_t refW = m_cacaoSwapWidth  ? m_cacaoSwapWidth  : m_cacaoLastWidth;
+    uint32_t refH = m_cacaoSwapHeight ? m_cacaoSwapHeight : m_cacaoLastHeight;
+    if (refW > 0
+     && (uint32_t(img->info().extent.width)  != refW
+      || uint32_t(img->info().extent.height) != refH)) {
+      static auto s_lastRej = std::chrono::steady_clock::now() - std::chrono::hours(1);
+      auto nowRej = std::chrono::steady_clock::now();
+      if (nowRej - s_lastRej > std::chrono::seconds(2)) {
+        s_lastRej = nowRej;
+        CacaoLogger::get().log(str::format("[SCENE-DEPTH] rejected by extent ",
+          img->info().extent.width, "x", img->info().extent.height));
+      }
       return;
     }
 
-    // Check if we have a cached projection matrix
-    if (!m_cacaoHasValidProj) {
-      // No projection matrix yet: fill AO buffer with 1.0
-      m_cacao.FillAoBuffer(this, 1.0f);
-      if (doLog) CacaoLogger::get().log("[FRAME] TryApply: no cached proj matrix, filled AO=1.0");
-      return;
+    static Rc<DxvkImage> s_lastLoggedImg;
+    static auto s_lastLog = std::chrono::steady_clock::now() - std::chrono::hours(1);
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_lastLog > std::chrono::seconds(2)) {
+      CacaoLogger::get().log(str::format("[SCENE-DEPTH] captured ", img.ptr(),
+        " ", img->info().extent.width, "x", img->info().extent.height));
+      s_lastLoggedImg = img;
+      s_lastLog       = now;
     }
 
-    // Game frame: apply CACAO with cached projection matrix
-    // We use the cached matrix because currentProj may be identity at Present time
-    if (doLog) CacaoLogger::get().log(str::format(
-      "[FRAME] TryApply: RUNNING frame=", s_frameCount,
-      " depthFmt=", (int)depthImg->info().format,
-      " depth=", depthImg->info().extent.width, "x", depthImg->info().extent.height));
+    // Keep the armed flag set: every same-extent depth bind inside the
+    // window updates the capture (the window closes at the first
+    // non-world SetTransform, before water/UI binds happen).
+    m_cacaoSceneDepthImg = img;
+  }
 
-    m_cacao.Apply(this, depthImg, reinterpret_cast<const float*>(&m_cacaoLastProj), width, height,
-                  GetOptions()->cacaoDebugFill);
+
+  void D3D9DeviceEx::TryApplyCACAO(uint32_t width, uint32_t height) {
+    if (!m_cacao.IsInitialized() || !m_cacao.IsEnabled())
+      return;
+
+    m_cacaoSwapWidth  = width;
+    m_cacaoSwapHeight = height;
+
+    static uint32_t s_paceCount = 0;
+    static auto     s_paceT0    = std::chrono::steady_clock::now();
+    if (++s_paceCount % 60 == 0) {
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - s_paceT0).count();
+      CacaoLogger::get().log(str::format("[PACE] 60 presents in ", ms, " ms"));
+      s_paceT0 = std::chrono::steady_clock::now();
+    }
+
+    // Diagnostic: log every 300 frames whether Apply actually runs
+    static uint32_t s_frameCount = 0;
+    bool doLog = (++s_frameCount % 300 == 0);
+
+    // The world-end chain ran since the last present: presents composite
+    // the fresh AO. Clearing the flag here re-arms the chain for the next
+    // frame's world pass (UE2 fires two world projections per frame, so
+    // Present is the only reliable frame boundary).
+    bool chainRan = m_cacaoChainSincePresent;
+    m_cacaoChainSincePresent = false;
+    if (chainRan)
+      return;
+
+    // No world render happened yet (boot) or a UI-only present without
+    // depth: keep AO neutral so UI is not darkened by a stale buffer.
+    if (!m_cacaoHaveAO || m_state.depthStencil == nullptr) {
+      m_cacao.AdvanceFrameIndex();
+      m_cacao.FillAoBuffer(this, 1.0f);
+      if (doLog) CacaoLogger::get().log("[FRAME] TryApply: neutral AO=1.0");
+    }
   }
 
 

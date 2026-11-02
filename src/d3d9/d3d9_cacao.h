@@ -5,6 +5,7 @@
 #include "../dxvk/dxvk_image.h"
 
 #include <array>
+#include <chrono>
 
 namespace dxvk {
 
@@ -81,7 +82,10 @@ namespace dxvk {
     CACAO_PASS_IMPORTANCE_MAP_B     = 5,
     CACAO_PASS_EDGE_BLUR            = 6,
     CACAO_PASS_APPLY                = 7,
-    CACAO_PASS_COUNT                = 8,
+    CACAO_PASS_GENERATE_Q0          = 8,
+    CACAO_PASS_GENERATE_Q1          = 9,
+    CACAO_PASS_GENERATE_Q2          = 10,
+    CACAO_PASS_COUNT                = 11,
   };
 
   class D3D9CacaoRenderer {
@@ -194,6 +198,15 @@ namespace dxvk {
     // We copy depth to our own image with proper layout for compute sampling.
     Rc<DxvkImage>     m_depthCopy;
 
+    // ── Cached image views (static per resolution) ───────────────────────
+    // Recreating ~15 VkImageViews every Apply was measurable overhead on
+    // the present thread; these only depend on our own intermediates.
+    Rc<DxvkImageView> m_vDeintDUav, m_vDeintDSrv, m_vDeintNUav, m_vDeintNSrv;
+    std::array<Rc<DxvkImageView>, 4> m_vDeintDMips;
+    Rc<DxvkImageView> m_vPingSrv, m_vPingUav, m_vPongSrv, m_vPongUav;
+    Rc<DxvkImageView> m_vImpSrv, m_vLoadSrv;
+    Rc<DxvkImageView> m_vAoUavs[kFrameLag];
+
     // ── Constants UBO (double-buffered to avoid race conditions) ───────────
     Rc<DxvkBuffer> m_constantBuffers[kFrameLag];  // One buffer per frame in flight
 
@@ -205,6 +218,9 @@ namespace dxvk {
     uint32_t          m_readbackFrameCount = 0u;
     Rc<DxvkBuffer>    m_readbackBuffer;   // 8 bytes: one RGBA16F pixel
     bool              m_readbackPending   = false; // GPU copy issued, not yet read
+    // Consecutive per-apply readback probes after each full dump: catches
+    // frame-to-frame AO state alternation (flicker) in the log.
+    uint32_t          m_probeBurst        = 0;
 
     // ── Full-buffer dump (cacaodump_A/B rotating pair) ──────────────────
     // Every readback frame with cacaoDump enabled copies the full AO result,
@@ -219,6 +235,10 @@ namespace dxvk {
     uint32_t          m_dumpWriteSlot     = 0;
     uint32_t          m_dumpWriteAt       = 0;
     uint32_t          m_applyCount        = 0;
+    // Host-side PGM writing is slow and runs on the present thread;
+    // issue full-buffer dumps at most once per this interval.
+    static constexpr std::chrono::milliseconds kDumpMinInterval { 5000 };
+    std::chrono::steady_clock::time_point m_dumpLastIssue {};
 
     void              WriteDumpFiles(uint32_t slot);
   };
