@@ -51,11 +51,21 @@ vec4 blend_linear_sdr(vec4 dst, vec4 src) {
 }
 
 
-vec4 composite_image(vec4 color) {
+vec4 composite_image(vec4 color, ivec2 srcCoord) {
   ivec2 coord = ivec2(gl_FragCoord.xy);
 
   if (c_composite_ao) {
-    float ao = texelFetch(s_ao, coord, 0).r;
+    // The AO buffer is allocated at the SOURCE (back buffer) size, so it must
+    // be sampled with the SOURCE pixel coordinate, not the destination
+    // gl_FragCoord: under present scaling (e.g. a 1920x1058 game frame
+    // presented into a 1920x1080 swap chain) gl_FragCoord-based sampling
+    // shifts the AO vertically by up to the letterbox height, and the
+    // out-of-source rows (the black bars) fetch AO for scene rows, which
+    // shows up as a static strip glued to the screen edge.
+    float ao = 1.0f;
+    if (all(greaterThanEqual(srcCoord, ivec2(0)))
+     && all(lessThan(srcCoord, src_extent)))
+      ao = texelFetch(s_ao, srcCoord, 0).r;
     if (c_ao_debug_view)
       color.rgb = vec3(ao);  // show raw AO greyscale, skip HUD/cursor
     else {

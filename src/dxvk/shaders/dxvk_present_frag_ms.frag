@@ -13,6 +13,6 @@ void main() {
   for (uint i = 1; i < c_samples; i++)
     o_color += input_to_sc_rgb(texelFetch(s_image_ms, coord, int(i)));
 
-  o_color = composite_image(o_color / float(c_samples));
+  o_color = composite_image(o_color / float(c_samples), coord);
   o_color = sc_rgb_to_output(o_color);
 }

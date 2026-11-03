@@ -736,6 +736,7 @@ void D3D9CacaoRenderer::UpdateConstants(
   const float worldRadius = (depthLinearizeMul > 0.0f)
       ? m_radius * depthLinearizeMul
       : m_radius;  // fallback: use raw radius if projection is degenerate
+  m_worldRadiusScale = depthLinearizeMul;  // diagnostics: radius scale factor
   c->EffectRadius                       = worldRadius;
   c->EffectShadowStrength               = m_strength * 2.0f;  // user 0-2 → internal 0-4
   c->EffectShadowPow                    = 1.5f;
@@ -986,6 +987,36 @@ void D3D9CacaoRenderer::Apply(
       " aoStrip[min=", aoMin, " max=", aoMax, "]",
       " first4=", half2float(strip[0]), ",", half2float(strip[4]), ",",
       half2float(strip[8]), ",", half2float(strip[12])));
+
+    // World-diagnostics rows (offsets 1024/1152/1536, see copy side).
+    {
+      const float* depthRow = reinterpret_cast<const float*>(base + 1024);
+      float dMin = 1e9f, dMax = -1e9f;
+      for (uint32_t i = 0; i < 16; i++) {
+        dMin = std::min(dMin, depthRow[i]);
+        dMax = std::max(dMax, depthRow[i]);
+      }
+      const float* ssaoRow = reinterpret_cast<const float*>(base + 1152);
+      float sMin = 1e9f, sMax = -1e9f;
+      for (uint32_t i = 0; i < 16; i++) {
+        sMin = std::min(sMin, ssaoRow[i * 2 + 0]);
+        sMax = std::max(sMax, ssaoRow[i * 2 + 0]);
+      }
+      const uint16_t* strip2 = reinterpret_cast<const uint16_t*>(base + 1536);
+      float a2Min = 1e9f, a2Max = -1e9f;
+      for (uint32_t i = 0; i < 64; i++) {
+        float ao = half2float(strip2[i * 4 + 0]);
+        a2Min = std::min(a2Min, ao);
+        a2Max = std::max(a2Max, ao);
+      }
+      CacaoLogger::get().log(str::format(
+        "[READBACK2] depthRow[min=", dMin, " max=", dMax, "]",
+        " ssaoRow[min=", sMin, " max=", sMax, "]",
+        " aoTop[min=", a2Min, " max=", a2Max, "]",
+        " radius=", m_radius * m_worldRadiusScale,
+        " fadeZero=", m_radius * m_worldRadiusScale * 20.0f,
+        " msaa=", m_lastDepthSampleCount));
+    }
   }
 
   m_applyCount++;
@@ -1059,6 +1090,7 @@ void D3D9CacaoRenderer::Apply(
     UpdateConstants(&consts, projMatrix4x4, width, height);
     std::memcpy(m_constantBuffers[m_frameIndex]->mapPtr(0), &consts, sizeof(consts));
   }
+  m_lastDepthSampleCount = depthImage->info().sampleCount;
 
   BufSizeInfo bsi;
   calcBufSizeInfo(width, height, &bsi);
@@ -1635,6 +1667,18 @@ void D3D9CacaoRenderer::Apply(
         if (useSnapInput)
           copyRegion(32, depthCopy,  VK_IMAGE_ASPECT_DEPTH_BIT,
                      int32_t(w / 2), int32_t(h / 2), 1, 1);
+        // 5) world-diagnostics rows: deintD 16x1 and blurred SSAO 16x1 at the
+        //    center height (uniformity detection: an all-equal row means the
+        //    deinterleave/tap pipeline collapsed to a constant field), and a
+        //    second aoFinal strip at quarter height (upper scene area).
+        copyRegion(1024, deintD,    VK_IMAGE_ASPECT_COLOR_BIT,
+                   int32_t(bsiCopy.deinterleavedDepthBufferWidth / 2) - 8,
+                   int32_t(bsiCopy.deinterleavedDepthBufferHeight / 2), 16, 1);
+        copyRegion(1152, finalSsao, VK_IMAGE_ASPECT_COLOR_BIT,
+                   int32_t(bsiCopy.ssaoBufferWidth / 2) - 8,
+                   int32_t(bsiCopy.ssaoBufferHeight / 2), 16, 1);
+        copyRegion(1536, aoFinal,   VK_IMAGE_ASPECT_COLOR_BIT,
+                   int32_t(w / 2) - 32, int32_t(h / 4), 64, 1);
       }
 
       // 4) Full-buffer dump (rotating A/B) when enabled in config.
