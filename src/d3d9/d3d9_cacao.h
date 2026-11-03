@@ -158,6 +158,11 @@ namespace dxvk {
     float         m_strength    = 1.0f;
     float         m_shadowClamp = 0.98f;
 
+    // Diagnostics: world radius scale (m_radius * depthLinearizeMul, set in
+    // UpdateConstants) and the sample count of the last chain input depth.
+    float         m_worldRadiusScale    = 1.0f;
+    uint32_t      m_lastDepthSampleCount = 1u;
+
     uint32_t      m_width  = 0;
     uint32_t      m_height = 0;
 

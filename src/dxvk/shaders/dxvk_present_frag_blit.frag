@@ -32,6 +32,6 @@ void main() {
                     input_to_sc_rgb(texelFetch(s_image, i_coord + ivec2(1, 1), 0)), f_coord.x),
                 f_coord.y);
 
-  o_color = composite_image(o_color);
+  o_color = composite_image(o_color, i_coord);
   o_color = sc_rgb_to_output(o_color);
 }
