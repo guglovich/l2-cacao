@@ -741,8 +741,14 @@ void D3D9CacaoRenderer::UpdateConstants(
   c->EffectShadowStrength               = m_strength * 2.0f;  // user 0-2 → internal 0-4
   c->EffectShadowPow                    = 1.5f;
   c->EffectShadowClamp                  = m_shadowClamp;
-  c->EffectFadeOutMul                   = -1.0f / (worldRadius * 20.0f);  // fade over 20x radius
-  c->EffectFadeOutAdd                   = 1.0f;
+  // Fadeout, SDK semantics (fadeOutFrom / fadeOutTo): FULL effect up to
+  // worldRadius, linear falloff to zero at worldRadius*40 (=1600 units for
+  // radius 4). The old linear-from-zero 20x fade (zero at 800) suppressed
+  // most of the mid-range world geometry — in an open L2 world the visible
+  // terrain is mostly 300..1500 units away, so the AO read as exactly
+  // neutral everywhere. Sky/far background still fades out completely.
+  c->EffectFadeOutMul                   = -1.0f / (worldRadius * 39.0f);
+  c->EffectFadeOutAdd                   = 1.0f + 1.0f / 39.0f;
   c->EffectHorizonAngleThreshold        = 0.06f;
   c->EffectSamplingRadiusNearLimitRec   = 1.0f / (worldRadius * 1.2f / tanHalfFOVY);
   c->DepthPrecisionOffsetMod            = 0.9992f;
@@ -907,7 +913,10 @@ void D3D9CacaoRenderer::WriteDumpFiles(uint32_t slot) {
     const float maxZ = 30000.0f, invLog = 1.0f / std::log(1.0f + maxZ);
     for (uint32_t i = 0; i < px.size(); i++) {
       float z = src[i] < 0.0f ? 0.0f : src[i];
-      px[i] = uint8_t(std::log(1.0f + z) * invLog * 255.0f);
+      // Clamp: sky (~far, viewZ ~66000) exceeds maxZ and would wrap around
+      // uint8_t to near-black, looking like garbage in the dump.
+      float v = std::log(1.0f + z) * invLog * 255.0f;
+      px[i] = uint8_t(v > 255.0f ? 255.0f : v);
     }
     char name[64];
     snprintf(name, sizeof(name), "cacaodump_%s_depth.pgm", tag);
@@ -1014,7 +1023,7 @@ void D3D9CacaoRenderer::Apply(
         " ssaoRow[min=", sMin, " max=", sMax, "]",
         " aoTop[min=", a2Min, " max=", a2Max, "]",
         " radius=", m_radius * m_worldRadiusScale,
-        " fadeZero=", m_radius * m_worldRadiusScale * 20.0f,
+        " fadeZero=", m_radius * m_worldRadiusScale * 40.0f,
         " msaa=", m_lastDepthSampleCount));
     }
   }

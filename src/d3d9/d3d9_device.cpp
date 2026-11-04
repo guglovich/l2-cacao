@@ -4756,7 +4756,13 @@ namespace dxvk {
         } else {
           m_cacaoSceneDepthArmed = false;
           m_cacaoChainSignal = 1;
-          ApplyCACAOAtWorldEnd();
+          // DO NOT fire the chain here. In the world the first off-aspect
+          // (water/reflection) projection can appear BEFORE the world
+          // geometry is rendered — the chain then samples a depth buffer
+          // that holds only the sky dome (a near-uniform field, telemetry
+          // 04.11: depthRow 731.8 ±0.003 across 16 px) and computes
+          // exactly neutral AO. The chain fires later, at the first
+          // non-perspective (UI) projection, after the world pass.
           // Log each distinct rejected matrix only once (water passes
           // rebind the square projection thousands of times per second).
           static Matrix4 s_lastRejected = {};
