@@ -1627,6 +1627,8 @@ namespace dxvk {
     // re-fires on the fuller scene depth (max 3 chains per present).
     bool                            m_cacaoChainRerunArmed   = false;
     uint32_t                        m_cacaoChainReruns       = 0;
+    uint32_t                        m_cacaoChainCount        = 0;
+    uint32_t                        m_cacaoLastChainCount    = 0;
     void                            TryCaptureCacaoSceneDepth();
     void                            ApplyCACAOAtWorldEnd();
     // Single-sample resolve target for MSAA depth buffers.
