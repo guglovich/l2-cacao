@@ -72,6 +72,18 @@ namespace dxvk {
     float  NormalsWorldToViewspaceMatrix[4][4];
   };
 
+  // Push constants for the mid-frame composite fragment shader.
+  // Must match the push_block in dxvk_cacao_mid_frag.frag exactly.
+  struct MidCompositeParams {
+    int32_t  srcExtent[2];       // back buffer extent (pixels)
+    uint32_t samplerScene;       // sampler heap index (linear clamp)
+    float    darkMask;           // baked-lighting compensation
+    float    contactT0;          // contact mode thresholds
+    float    contactT1;
+    float    contactStrength;
+    float    debugView;          // 1.0 = render raw AO grayscale
+  };
+
   // Pass indices for pipeline array
   enum CacaoPass : uint32_t {
     CACAO_PASS_PREPARE_DEPTHS       = 0,
@@ -130,6 +142,22 @@ namespace dxvk {
 
     void SetDumpEnabled(bool enabled) { m_dumpEnabled = enabled; }
 
+    // Mid-frame composite: bake color * AO into the back buffer right at the
+    // world->UI boundary, before the game draws its interface. When enabled,
+    // the present blitter composite is bypassed entirely (UI stays untouched,
+    // letterbox/scaling artifacts are impossible by construction).
+    void CompositeMidFrame(
+      D3D9DeviceEx*        device,
+      const Rc<DxvkImage>& backBuffer,
+      float                darkMask,
+      float                contactT0,
+      float                contactT1,
+      float                contactStrength,
+      bool                 debugView);
+
+    void SetMidComposite(bool enabled) { m_midComposite = enabled; }
+    bool MidCompositeEnabled() const { return m_midComposite; }
+
   private:
     void InitPipelines();
     void InitResources(uint32_t width, uint32_t height);
@@ -162,6 +190,22 @@ namespace dxvk {
     // UpdateConstants) and the sample count of the last chain input depth.
     float         m_worldRadiusScale    = 1.0f;
     uint32_t      m_lastDepthSampleCount = 1u;
+
+    // ── Mid-frame composite state ──────────────────────────────────────────
+    bool                 m_midComposite = false;
+    bool                 m_midInit      = false;
+    VkFormat             m_midFormat    = VK_FORMAT_UNDEFINED;
+    VkExtent3D           m_midExtent    = { };
+    Rc<DxvkImage>        m_bbImage;                 // tracked for RTV reuse
+    Rc<DxvkImageView>    m_bbRtv;
+    std::array<Rc<DxvkImage>,     4> m_sceneCopies = { };
+    std::array<Rc<DxvkImageView>, 4> m_sceneSrvs   = { };
+    const DxvkPipelineLayout* m_midLayout  = nullptr;
+    VkPipeline           m_midPipeline = VK_NULL_HANDLE;
+    Rc<DxvkSampler>      m_midSampler;
+
+    void InitMidComposite(VkFormat format, VkExtent3D extent);
+    void DestroyMidComposite();
 
     uint32_t      m_width  = 0;
     uint32_t      m_height = 0;

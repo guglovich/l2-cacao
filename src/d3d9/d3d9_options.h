@@ -185,6 +185,7 @@ namespace dxvk {
     float   cacaoContactT0;    ///< Contact mode: occlusion threshold where shadows start (default: 0.12)
     float   cacaoContactT1;    ///< Contact mode: occlusion threshold for full shadow (default: 0.30)
     float   cacaoContactStrength; ///< Contact mode: max shadow strength at full occlusion (0=off, default: 0)
+    bool    cacaoMidComposite; ///< Bake AO into the back buffer at the world->UI boundary instead of compositing at present: UI is never darkened (default: true)
     bool    cacaoDebugFill;    ///< Debug: fill AO with 0.5 (tests composite path, default: false)
     bool    cacaoDebugView;    ///< Debug: show raw AO buffer as greyscale overlay (default: false)
   };
