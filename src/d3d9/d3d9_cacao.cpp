@@ -3,7 +3,20 @@
  * FidelityFX CACAO (Combined Adaptive Compute Ambient Occlusion)
  * integrated as a DXVK built-in post-process pass.
  *
- * Quality path: Q3 (non-adaptive) for High.
+ * STATUS (07.11.2026): WORKING IN-GAME — login, character select and the
+ * game world produce geometry-attached ambient occlusion (user-confirmed).
+ * Architecture summary (see AGENTS.md / DEVLOG.md / docs/DX9_VULKAN_WINE_PATHS.md):
+ *  - chain triggers at the first non-perspective (UI) SetTransform after a
+ *    world projection; later world projections re-arm it (L2 renders terrain,
+ *    a UI fragment, then pawns/props — max 3 chains per present, 46d25aad
+ *    + e4184be8);
+ *  - mid-frame composite bakes color * AO into the back buffer before the
+ *    UI draws (d3d9.cacaoMidComposite, default on, c06f60d4);
+ *  - D3D9 depth convention (0=near, 1=far), non-adaptive q0/q1/q2 generate
+ *    variants (no temporal feedback), SDK-style fadeout (full effect to
+ *    worldRadius, zero at worldRadius*40).
+ *
+ * Quality path: Q2 (non-adaptive) for Medium and High.
  * Resources are lazily allocated on first Apply() and reallocated if
  * the resolution changes.
  *
