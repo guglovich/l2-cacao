@@ -4751,6 +4751,17 @@ namespace dxvk {
             }
             m_cacaoSceneDepthArmed = true;
             TryCaptureCacaoSceneDepth();
+          } else if (m_cacaoChainReruns < 2) {
+            // A LATER world pass started within the same frame. L2's world
+            // layout renders terrain first, then a UI-ortho fragment (which
+            // fires the first chain on a depth holding ONLY the terrain —
+            // telemetry 06.11: world dumps show terrain+sky, no pawns), and
+            // only then pawns/props with their own world projection. Re-arm
+            // so the chain re-fires after the last world render; the last
+            // chain per present carries the full scene depth.
+            m_cacaoSceneDepthArmed  = true;
+            TryCaptureCacaoSceneDepth();
+            m_cacaoChainRerunArmed = true;
           }
           m_cacaoProjSetCount++;
         } else {
@@ -9588,7 +9599,12 @@ namespace dxvk {
   void D3D9DeviceEx::ApplyCACAOAtWorldEnd() {
     if (!m_cacao.IsInitialized() || !m_cacao.IsEnabled())
       return;
-    if (m_cacaoChainSincePresent || !m_cacaoHasValidProj)
+    // A re-run is armed when a later world projection was seen after the
+    // first chain this frame (L2 renders pawns/props after the first UI
+    // fragment); the chain then re-fires with the fuller scene depth.
+    if (m_cacaoChainSincePresent && !m_cacaoChainRerunArmed)
+      return;
+    if (!m_cacaoHasValidProj)
       return;
 
     // The world pass has just finished (the first non-world projection was
@@ -9610,6 +9626,8 @@ namespace dxvk {
       return;
 
     m_cacaoChainSincePresent = true;
+    m_cacaoChainRerunArmed   = false;
+    m_cacaoChainReruns++;
     m_cacaoHaveAO            = true;
 
     static uint32_t s_chainLog = 0;
@@ -9757,6 +9775,8 @@ namespace dxvk {
     // Present is the only reliable frame boundary).
     bool chainRan = m_cacaoChainSincePresent;
     m_cacaoChainSincePresent = false;
+    m_cacaoChainRerunArmed   = false;
+    m_cacaoChainReruns       = 0;
     if (chainRan)
       return;
 
