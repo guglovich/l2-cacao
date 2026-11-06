@@ -84,19 +84,32 @@ namespace dxvk {
     float    debugView;          // 1.0 = render raw AO grayscale
   };
 
-  // Pass indices for pipeline array
+  // Push constants: sampler heap indices for the FFX sampler macros
+  // (g_PointClampSampler etc. -> s_cacaoSamplers[idx*] in the callbacks copy).
+  struct CacaoSamplerIndices {
+    uint32_t idxPointClamp;
+    uint32_t idxPointMirror;
+    uint32_t idxLinearClamp;
+    uint32_t idxViewspaceDepthTap;
+    uint32_t idxRealPointClamp;
+  };
+  static constexpr uint32_t kSamplerPushSize = sizeof(CacaoSamplerIndices);
+
+  // Pass indices for pipeline array (heap-migrated: native FFX GLSL with
+  // DXVK binding conventions; the adaptive Q3 pipeline is not built —
+  // Medium/High use the non-adaptive q2 variant)
   enum CacaoPass : uint32_t {
     CACAO_PASS_PREPARE_DEPTHS       = 0,
     CACAO_PASS_PREPARE_NORMALS      = 1,
-    CACAO_PASS_GENERATE_Q3          = 2,
-    CACAO_PASS_IMPORTANCE_MAP       = 3,
-    CACAO_PASS_IMPORTANCE_MAP_A     = 4,
-    CACAO_PASS_IMPORTANCE_MAP_B     = 5,
-    CACAO_PASS_EDGE_BLUR            = 6,
-    CACAO_PASS_APPLY                = 7,
-    CACAO_PASS_GENERATE_Q0          = 8,
-    CACAO_PASS_GENERATE_Q1          = 9,
-    CACAO_PASS_GENERATE_Q2          = 10,
+    CACAO_PASS_GENERATE_Q0          = 2,
+    CACAO_PASS_GENERATE_Q1          = 3,
+    CACAO_PASS_GENERATE_Q2          = 4,
+    CACAO_PASS_IMPORTANCE_MAP       = 5,
+    CACAO_PASS_IMPORTANCE_MAP_A     = 6,
+    CACAO_PASS_IMPORTANCE_MAP_B     = 7,
+    CACAO_PASS_EDGE_BLUR            = 8,
+    CACAO_PASS_APPLY                = 9,
+    CACAO_PASS_CLEAR_COUNTER        = 10,
     CACAO_PASS_COUNT                = 11,
   };
 
@@ -210,25 +223,16 @@ namespace dxvk {
     uint32_t      m_width  = 0;
     uint32_t      m_height = 0;
 
-    // ── Raw Vulkan pipeline objects ────────────────────────────────────────
-    std::array<VkPipeline,              CACAO_PASS_COUNT> m_pipelines       = {};
-    std::array<VkDescriptorSetLayout,   CACAO_PASS_COUNT> m_setLayouts      = {};
-    std::array<VkPipelineLayout,        CACAO_PASS_COUNT> m_pipelineLayouts = {};
-    std::array<VkSampler, 5>                              m_samplers        = {};
-
-    // ── Descriptor pool and pre-allocated sets ────────────────────────────
-    // Double-buffered: 2 frames × kSetsPerFrame sets = kTotalSets sets.
-    // Alternating each frame avoids updating sets while GPU executes them.
-    // 4 = swapchain image count: descriptor sets and AO buffers are updated
-    // on the host at record time; a larger lag guarantees the GPU has finished
-    // using slot N-kTotalSets before it is reused, preventing flicker under
-    // heavy scenes where the CS queue runs multiple frames behind.
+    // ── Raw Vulkan pipeline objects (built-in layouts; bindResources) ──────
+    std::array<VkPipeline,                CACAO_PASS_COUNT> m_pipelines       = {};
+    std::array<const DxvkPipelineLayout*, CACAO_PASS_COUNT> m_pipelineLayouts = {};
+    std::array<Rc<DxvkSampler>, 5> m_heapSamplers = { };
+    // ── Frame slot ring ────────────────────────────────────────────────────
+    // 4 slots: aoFinal и constant buffers ротируются по слоту; под heap-моделью
+    // дескрипторы аллоцируются per-bind, race-причина kFrameLag ушла, слот
+    // оставлен для буферов.
     static constexpr uint32_t kFrameLag    = 4u;
-    static constexpr uint32_t kSetsPerFrame = 8u;  // DEPTHS, NORMALS, Q3, BLUR×4, APPLY
-    static constexpr uint32_t kTotalSets   = kFrameLag * kSetsPerFrame;
 
-    VkDescriptorPool                                             m_descPool   = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, kTotalSets>                      m_descSets   = {};
     uint32_t                                                     m_frameIndex = 0u;
 
     // ── Intermediate render targets ────────────────────────────────────────

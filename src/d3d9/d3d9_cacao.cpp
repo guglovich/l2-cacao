@@ -58,19 +58,19 @@
 #include <vector>
 #include <cstdio>
 
-// ── Compiled SPIR-V headers (compiled from FidelityFX SDK GLSL) ───────────────
-#include "cacao_spirv/ffx_cacao_prepare_native_depths_and_mips_pass.h"
-#include "cacao_spirv/ffx_cacao_prepare_native_normals_pass.h"
-#include "cacao_spirv/ffx_cacao_generate_q0_pass.h"
-#include "cacao_spirv/ffx_cacao_generate_q1_pass.h"
-#include "cacao_spirv/ffx_cacao_generate_q2_pass.h"
-#include "cacao_spirv/ffx_cacao_generate_q3_pass.h"
-#include "cacao_spirv/ffx_cacao_generate_importance_map_pass.h"
-#include "cacao_spirv/ffx_cacao_generate_importance_map_a_pass.h"
-#include "cacao_spirv/ffx_cacao_generate_importance_map_b_pass.h"
-#include "cacao_spirv/ffx_cacao_edge_sensitive_blur_8_pass.h"
-#include "cacao_spirv/ffx_cacao_apply_pass.h"
-#include "cacao_spirv/ffx_cacao_clear_load_counter_pass.h"
+// ── Compiled SPIR-V headers: native FFX GLSL + DXVK binding conventions ──────
+// (tools/compile_cacao2.sh; set 1 = ресурсы, set 0 = sampler heap)
+#include "cacao_spirv/cacao_prepare_depths_pass.h"
+#include "cacao_spirv/cacao_prepare_normals_pass.h"
+#include "cacao_spirv/cacao_generate_q0_pass.h"
+#include "cacao_spirv/cacao_generate_q1_pass.h"
+#include "cacao_spirv/cacao_generate_q2_pass.h"
+#include "cacao_spirv/cacao_blur8_pass.h"
+#include "cacao_spirv/cacao_apply_pass.h"
+#include "cacao_spirv/cacao_importance_a_pass.h"
+#include "cacao_spirv/cacao_importance_b_pass.h"
+#include "cacao_spirv/cacao_importance_pass.h"
+#include "cacao_spirv/cacao_clear_counter_pass.h"
 
 namespace dxvk {
 
@@ -164,14 +164,6 @@ static constexpr uint32_t B_UAV_OUTPUT                = 2008;
 static constexpr uint32_t B_CB_CACAO                  = 3000;
 
 // Set indices within a single frame's descriptor set block
-static constexpr uint32_t SET_IDX_DEPTHS  = 0;
-static constexpr uint32_t SET_IDX_NORMALS = 1;
-static constexpr uint32_t SET_IDX_Q3      = 2;
-static constexpr uint32_t SET_IDX_BLUR_0  = 3;
-static constexpr uint32_t SET_IDX_BLUR_1  = 4;
-static constexpr uint32_t SET_IDX_BLUR_2  = 5;
-static constexpr uint32_t SET_IDX_BLUR_3  = 6;
-static constexpr uint32_t SET_IDX_APPLY   = 7;
 // (= kSetsPerFrame = 8)
 
 
@@ -197,284 +189,102 @@ D3D9CacaoRenderer::~D3D9CacaoRenderer() {
   auto vkd = m_device->vkd();
   VkDevice dev = vkd->device();
 
-  if (m_descPool)
-    vkd->vkDestroyDescriptorPool(dev, m_descPool, nullptr);
-
   for (auto& pl : m_pipelines)
     if (pl) vkd->vkDestroyPipeline(dev, pl, nullptr);
-  for (auto& pl : m_pipelineLayouts)
-    if (pl) vkd->vkDestroyPipelineLayout(dev, pl, nullptr);
-  for (auto& sl : m_setLayouts)
-    if (sl) vkd->vkDestroyDescriptorSetLayout(dev, sl, nullptr);
-  for (auto& s : m_samplers)
-    if (s) vkd->vkDestroySampler(dev, s, nullptr);
+  // Built-in pipeline layouts и сэмплеры освобождаются устройством
+  // (shared objects, не владеются рендерером).
 }
 
-// ── Vulkan helpers ────────────────────────────────────────────────────────────
-
-struct BindDef {
-  uint32_t             binding;
-  VkDescriptorType     type;
-  uint32_t             count;
-  VkShaderStageFlags   stage;
-};
-
-static VkDescriptorSetLayout makeSetLayout(
-    const Rc<vk::DeviceFn>& vkd,
-    const std::vector<BindDef>& defs,
-    const VkSampler* immutableSamplers = nullptr,
-    uint32_t         immutableSamplerBase = 0,
-    uint32_t         immutableSamplerCount = 0)
-{
-  std::vector<VkDescriptorSetLayoutBinding> lb;
-  lb.reserve(defs.size());
-  for (auto& d : defs) {
-    VkDescriptorSetLayoutBinding b = {};
-    b.binding         = d.binding;
-    b.descriptorType  = d.type;
-    b.descriptorCount = d.count;
-    b.stageFlags      = d.stage;
-    if (immutableSamplers && d.type == VK_DESCRIPTOR_TYPE_SAMPLER
-        && d.binding >= immutableSamplerBase
-        && d.binding < immutableSamplerBase + immutableSamplerCount)
-    {
-      b.pImmutableSamplers = immutableSamplers + (d.binding - immutableSamplerBase);
-    }
-    lb.push_back(b);
-  }
-
-  VkDescriptorSetLayoutCreateInfo ci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-  ci.bindingCount = uint32_t(lb.size());
-  ci.pBindings    = lb.data();
-
-  VkDescriptorSetLayout layout = VK_NULL_HANDLE;
-  if (vkd->vkCreateDescriptorSetLayout(vkd->device(), &ci, nullptr, &layout) != VK_SUCCESS)
-    throw DxvkError("CACAO: failed to create descriptor set layout");
-  return layout;
-}
-
-static VkPipelineLayout makePipelineLayout(
-    const Rc<vk::DeviceFn>& vkd,
-    VkDescriptorSetLayout setLayout)
-{
-  VkPipelineLayoutCreateInfo ci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-  ci.setLayoutCount = 1;
-  ci.pSetLayouts    = &setLayout;
-
-  VkPipelineLayout layout = VK_NULL_HANDLE;
-  if (vkd->vkCreatePipelineLayout(vkd->device(), &ci, nullptr, &layout) != VK_SUCCESS)
-    throw DxvkError("CACAO: failed to create pipeline layout");
-  return layout;
-}
-
-static VkPipeline makeComputePipeline(
-    const Rc<vk::DeviceFn>& vkd,
-    VkPipelineLayout pipelineLayout,
-    const uint32_t* spirv,
-    size_t spirvBytes)
-{
-  VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-  smci.codeSize = spirvBytes;
-  smci.pCode    = spirv;
-
-  VkShaderModule shmod = VK_NULL_HANDLE;
-  if (vkd->vkCreateShaderModule(vkd->device(), &smci, nullptr, &shmod) != VK_SUCCESS)
-    throw DxvkError("CACAO: failed to create shader module");
-
-  VkComputePipelineCreateInfo pci = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-  pci.layout            = pipelineLayout;
-  pci.basePipelineIndex = -1;
-  pci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-  pci.stage.module = shmod;
-  pci.stage.pName  = "main";
-  pci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-
-  VkPipeline pipeline = VK_NULL_HANDLE;
-  VkResult vr = vkd->vkCreateComputePipelines(vkd->device(),
-    VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline);
-
-  vkd->vkDestroyShaderModule(vkd->device(), shmod, nullptr);
-
-  if (vr != VK_SUCCESS)
-    throw DxvkError("CACAO: failed to create compute pipeline");
-  return pipeline;
-}
-
-static VkSampler makeSampler(
-    const Rc<vk::DeviceFn>& vkd,
-    VkFilter        filter,
-    VkSamplerAddressMode addressMode,
-    float           maxLod = 0.0f)
-{
-  VkSamplerCreateInfo sci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
-  sci.magFilter        = filter;
-  sci.minFilter        = filter;
-  sci.mipmapMode       = filter == VK_FILTER_LINEAR
-                           ? VK_SAMPLER_MIPMAP_MODE_LINEAR
-                           : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-  sci.addressModeU     = addressMode;
-  sci.addressModeV     = addressMode;
-  sci.addressModeW     = addressMode;
-  sci.maxLod           = maxLod;
-
-  VkSampler s = VK_NULL_HANDLE;
-  if (vkd->vkCreateSampler(vkd->device(), &sci, nullptr, &s) != VK_SUCCESS)
-    throw DxvkError("CACAO: failed to create sampler");
-  return s;
-}
-
-// ── InitPipelines ─────────────────────────────────────────────────────────────
 void D3D9CacaoRenderer::InitPipelines() {
-  auto vkd = m_device->vkd();
-  VkDevice dev = vkd->device();
+  // ── Sampler heap: 5 FFX samplers, indices передаются push-константами ────
+  DxvkSamplerKey sk = { };
+  sk.setUsePixelCoordinates(false);
+  sk.setFilter(VK_FILTER_NEAREST, VK_FILTER_NEAREST, VK_SAMPLER_MIPMAP_MODE_NEAREST);
+  sk.setAddressModes(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                     VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                     VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+  m_heapSamplers[0] = m_device->createSampler(sk);   // PointClamp
+  sk.setAddressModes(VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+                     VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+                     VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT);
+  m_heapSamplers[1] = m_device->createSampler(sk);   // PointMirror
+  sk.setAddressModes(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                     VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                     VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+  sk.setFilter(VK_FILTER_LINEAR, VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST);
+  m_heapSamplers[2] = m_device->createSampler(sk);   // LinearClamp (bias 1000 старой
+                                                     // схемы не нужен: тапы берут мипы
+                                                     // явным mipOffset)
+  m_heapSamplers[3] = m_device->createSampler(sk);   // ViewspaceDepthTap
+  sk.setFilter(VK_FILTER_NEAREST, VK_FILTER_NEAREST, VK_SAMPLER_MIPMAP_MODE_NEAREST);
+  m_heapSamplers[4] = m_device->createSampler(sk);   // RealPointClamp
 
-  // ── Samplers ─────────────────────────────────────────────────────────────
-  m_samplers[0] = makeSampler(vkd, VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
-  m_samplers[1] = makeSampler(vkd, VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT);
-  m_samplers[2] = makeSampler(vkd, VK_FILTER_LINEAR,  VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, 1000.0f);
-  m_samplers[3] = makeSampler(vkd, VK_FILTER_LINEAR,  VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
-  m_samplers[4] = makeSampler(vkd, VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+  // ── Built-in layouts (set 1 bindings; set 0 = sampler heap) ──────────────
+  auto S  = VK_SHADER_STAGE_COMPUTE_BIT;
+  auto SI = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  auto ST = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  auto UB = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 
-  // ── Descriptor pool ───────────────────────────────────────────────────────
-  // Pre-allocate kTotalSets sets for double-buffered per-frame use.
-  const VkDescriptorPoolSize poolSizes[] = {
-    { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  kTotalSets * 16 },
-    { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  kTotalSets * 16 },
-    { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kTotalSets      },
-    { VK_DESCRIPTOR_TYPE_SAMPLER,        kTotalSets * 5  },
-  };
-  VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-  dpi.maxSets       = kTotalSets;
-  dpi.poolSizeCount = uint32_t(std::size(poolSizes));
-  dpi.pPoolSizes    = poolSizes;
-  if (vkd->vkCreateDescriptorPool(dev, &dpi, nullptr, &m_descPool) != VK_SUCCESS)
-    throw DxvkError("CACAO: failed to create descriptor pool");
+  // prepare: 0 depthIn, 1 normalIn(null), 2 mips[4], 3 deintD, 4 deintN, 5 CB
+  static const std::array<DxvkDescriptorSetLayoutBinding, 6> prepareB = {{
+    { SI, 1, S }, { SI, 1, S }, { ST, 4, S }, { ST, 1, S }, { ST, 1, S }, { UB, 1, S },
+  }};
+  // generate (q0/q1/q2): 0 loadCnt, 1..4 SRV, 5 pingUav, 6 CB
+  static const std::array<DxvkDescriptorSetLayoutBinding, 7> generateB = {{
+    { SI, 1, S }, { SI, 1, S }, { SI, 1, S }, { SI, 1, S }, { SI, 1, S },
+    { ST, 1, S }, { UB, 1, S },
+  }};
+  // importance (a/b/gen): 0..2 SRV, 3..5 UAV, 6 CB
+  static const std::array<DxvkDescriptorSetLayoutBinding, 7> importanceB = {{
+    { SI, 1, S }, { SI, 1, S }, { SI, 1, S },
+    { ST, 1, S }, { ST, 1, S }, { ST, 1, S }, { UB, 1, S },
+  }};
+  // blur/apply: 0 SRV, 1 UAV, 2 CB
+  static const std::array<DxvkDescriptorSetLayoutBinding, 3> blurB = {{
+    { SI, 1, S }, { ST, 1, S }, { UB, 1, S },
+  }};
+  // clear: 0 loadCntUav, 1 CB
+  static const std::array<DxvkDescriptorSetLayoutBinding, 2> clearB = {{
+    { ST, 1, S }, { UB, 1, S },
+  }};
 
-  // ── Sampler bindings shared by all passes ─────────────────────────────────
-  const std::vector<BindDef> samplerDefs = {
-    { B_SAMPLER_POINT_CLAMP,      VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
-    { B_SAMPLER_POINT_MIRROR,     VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
-    { B_SAMPLER_LINEAR_CLAMP,     VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
-    { B_SAMPLER_VIEWSPACE_DEPTH,  VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
-    { B_SAMPLER_REAL_POINT_CLAMP, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
-  };
+  m_pipelineLayouts[CACAO_PASS_PREPARE_DEPTHS] =
+    m_device->createBuiltInPipelineLayout(DxvkPipelineLayoutFlag::UsesSamplerHeap, S, kSamplerPushSize, prepareB.size(), prepareB.data());
+  m_pipelineLayouts[CACAO_PASS_PREPARE_NORMALS] =
+    m_device->createBuiltInPipelineLayout(DxvkPipelineLayoutFlag::UsesSamplerHeap, S, kSamplerPushSize, prepareB.size(), prepareB.data());
+  for (auto pass : { CACAO_PASS_GENERATE_Q0, CACAO_PASS_GENERATE_Q1, CACAO_PASS_GENERATE_Q2 })
+    m_pipelineLayouts[pass] =
+      m_device->createBuiltInPipelineLayout(DxvkPipelineLayoutFlag::UsesSamplerHeap, S, kSamplerPushSize, generateB.size(), generateB.data());
+  for (auto pass : { CACAO_PASS_IMPORTANCE_MAP, CACAO_PASS_IMPORTANCE_MAP_A, CACAO_PASS_IMPORTANCE_MAP_B })
+    m_pipelineLayouts[pass] =
+      m_device->createBuiltInPipelineLayout(DxvkPipelineLayoutFlag::UsesSamplerHeap, S, kSamplerPushSize, importanceB.size(), importanceB.data());
+  m_pipelineLayouts[CACAO_PASS_EDGE_BLUR] =
+    m_device->createBuiltInPipelineLayout(DxvkPipelineLayoutFlag::UsesSamplerHeap, S, kSamplerPushSize, blurB.size(), blurB.data());
+  m_pipelineLayouts[CACAO_PASS_APPLY] =
+    m_device->createBuiltInPipelineLayout(DxvkPipelineLayoutFlag::UsesSamplerHeap, S, kSamplerPushSize, blurB.size(), blurB.data());
+  m_pipelineLayouts[CACAO_PASS_CLEAR_COUNTER] =
+    m_device->createBuiltInPipelineLayout(DxvkPipelineLayoutFlag::UsesSamplerHeap, S, kSamplerPushSize, clearB.size(), clearB.data());
 
-  auto buildLayout = [&](std::vector<BindDef> passDefs) -> VkDescriptorSetLayout {
-    for (auto& s : samplerDefs) passDefs.push_back(s);
-    passDefs.push_back({ B_CB_CACAO, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT });
-    return makeSetLayout(vkd, passDefs, m_samplers.data(), B_SAMPLER_POINT_CLAMP, 5);
-  };
-
-  // PASS_PREPARE_DEPTHS
-  m_setLayouts[CACAO_PASS_PREPARE_DEPTHS] = buildLayout({
-    { B_SRV_DEPTH_IN,     VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-    { B_UAV_DEPTH_MIPS,   VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  4, VK_SHADER_STAGE_COMPUTE_BIT },
-    { B_UAV_DEINT_DEPTHS, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-  });
-
-  // PASS_PREPARE_NORMALS
-  m_setLayouts[CACAO_PASS_PREPARE_NORMALS] = buildLayout({
-    { B_SRV_DEPTH_IN,       VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT },
-    { B_UAV_DEINT_NORMALS,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT },
-  });
-
-  // PASS_GENERATE_Qx — all four generate variants (q0/q1/q2/q3 SPIR-V) share
-  // the exact same descriptor interface (bindings 0-4 + UAV 2000 verified via
-  // spirv-dis), so each pass gets its own identical layout object (separate
-  // handles: the destructor destroys every slot).
-  {
-    std::vector<BindDef> genDefs = {
-      { B_SRV_LOAD_COUNTER,          VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-      { B_SRV_DEINTERLEAVED_DEPTHS,  VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-      { B_SRV_DEINTERLEAVED_NORMALS, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-      { B_SRV_SSAO_PING,             VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-      { B_SRV_IMPORTANCE_MAP,        VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-      { B_UAV_SSAO_PING,             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-    };
-    m_setLayouts[CACAO_PASS_GENERATE_Q3] = buildLayout(genDefs);
-    m_setLayouts[CACAO_PASS_GENERATE_Q0] = buildLayout(genDefs);
-    m_setLayouts[CACAO_PASS_GENERATE_Q1] = buildLayout(genDefs);
-    m_setLayouts[CACAO_PASS_GENERATE_Q2] = buildLayout(genDefs);
-  }
-
-  // PASS_IMPORTANCE_MAP — full bindings used by all three importance-map passes.
-  // Create SEPARATE layout objects for A and B to avoid double-destroy in destructor.
-  {
-    std::vector<BindDef> impDefs = {
-      { B_SRV_SSAO_PING,            VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-      { B_SRV_IMPORTANCE_MAP,       VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-      { B_SRV_IMPORTANCE_MAP_PONG,  VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },  // binding 7: g_ImportanceMapPong
-      { B_UAV_LOAD_COUNTER,         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-      { B_UAV_IMPORTANCE_MAP,       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-      { B_UAV_IMPORTANCE_MAP_PONG,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-    };
-    m_setLayouts[CACAO_PASS_IMPORTANCE_MAP]   = buildLayout(impDefs);
-    m_setLayouts[CACAO_PASS_IMPORTANCE_MAP_A] = buildLayout(impDefs);  // separate handle
-    m_setLayouts[CACAO_PASS_IMPORTANCE_MAP_B] = buildLayout(impDefs);  // separate handle
-  }
-
-  // PASS_EDGE_BLUR: ping → pong
-  m_setLayouts[CACAO_PASS_EDGE_BLUR] = buildLayout({
-    { B_SRV_SSAO_PING_APPLY,  VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-    { B_UAV_SSAO_PONG,        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-  });
-
-  // PASS_APPLY: ssao → aoFinal
-  m_setLayouts[CACAO_PASS_APPLY] = buildLayout({
-    { B_SRV_SSAO_PING_APPLY,  VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-    { B_UAV_OUTPUT,           VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT },
-  });
-
-  // ── Pipeline layouts (one per pass) ───────────────────────────────────────
-  for (uint32_t i = 0; i < CACAO_PASS_COUNT; i++)
-    m_pipelineLayouts[i] = makePipelineLayout(vkd, m_setLayouts[i]);
-
-  // ── Compute pipelines ──────────────────────────────────────────────────────
+  // ── Compute pipelines ─────────────────────────────────────────────────────
 #define MAKE_PIPELINE(pass, spv) \
-  m_pipelines[pass] = makeComputePipeline(vkd, m_pipelineLayouts[pass], \
-    spv, sizeof(spv))
+  m_pipelines[pass] = m_device->createBuiltInComputePipeline( \
+    m_pipelineLayouts[pass], util::DxvkBuiltInShaderStage(spv, nullptr))
 
-  MAKE_PIPELINE(CACAO_PASS_PREPARE_DEPTHS,    FFX_CACAO_PREPARE_NATIVE_DEPTHS_AND_MIPS_PASS_SPV);
-  MAKE_PIPELINE(CACAO_PASS_PREPARE_NORMALS,   FFX_CACAO_PREPARE_NATIVE_NORMALS_PASS_SPV);
-  MAKE_PIPELINE(CACAO_PASS_GENERATE_Q3,       FFX_CACAO_GENERATE_Q3_PASS_SPV);
-  MAKE_PIPELINE(CACAO_PASS_GENERATE_Q0,       FFX_CACAO_GENERATE_Q0_PASS_SPV);
-  MAKE_PIPELINE(CACAO_PASS_GENERATE_Q1,       FFX_CACAO_GENERATE_Q1_PASS_SPV);
-  MAKE_PIPELINE(CACAO_PASS_GENERATE_Q2,       FFX_CACAO_GENERATE_Q2_PASS_SPV);
-  MAKE_PIPELINE(CACAO_PASS_IMPORTANCE_MAP,    FFX_CACAO_GENERATE_IMPORTANCE_MAP_PASS_SPV);
-  MAKE_PIPELINE(CACAO_PASS_IMPORTANCE_MAP_A,  FFX_CACAO_GENERATE_IMPORTANCE_MAP_A_PASS_SPV);
-  MAKE_PIPELINE(CACAO_PASS_IMPORTANCE_MAP_B,  FFX_CACAO_GENERATE_IMPORTANCE_MAP_B_PASS_SPV);
-  MAKE_PIPELINE(CACAO_PASS_EDGE_BLUR,         FFX_CACAO_EDGE_SENSITIVE_BLUR_8_PASS_SPV);
-  MAKE_PIPELINE(CACAO_PASS_APPLY,             FFX_CACAO_APPLY_PASS_SPV);
+  MAKE_PIPELINE(CACAO_PASS_PREPARE_DEPTHS,   CACAO_PREPARE_DEPTHS_SPV);
+  MAKE_PIPELINE(CACAO_PASS_PREPARE_NORMALS,  CACAO_PREPARE_NORMALS_SPV);
+  MAKE_PIPELINE(CACAO_PASS_GENERATE_Q0,      CACAO_GENERATE_Q0_SPV);
+  MAKE_PIPELINE(CACAO_PASS_GENERATE_Q1,      CACAO_GENERATE_Q1_SPV);
+  MAKE_PIPELINE(CACAO_PASS_GENERATE_Q2,      CACAO_GENERATE_Q2_SPV);
+  MAKE_PIPELINE(CACAO_PASS_IMPORTANCE_MAP,   CACAO_IMPORTANCE_SPV);
+  MAKE_PIPELINE(CACAO_PASS_IMPORTANCE_MAP_A, CACAO_IMPORTANCE_A_SPV);
+  MAKE_PIPELINE(CACAO_PASS_IMPORTANCE_MAP_B, CACAO_IMPORTANCE_B_SPV);
+  MAKE_PIPELINE(CACAO_PASS_EDGE_BLUR,        CACAO_BLUR8_SPV);
+  MAKE_PIPELINE(CACAO_PASS_APPLY,            CACAO_APPLY_SPV);
+  MAKE_PIPELINE(CACAO_PASS_CLEAR_COUNTER,    CACAO_CLEAR_COUNTER_SPV);
 
 #undef MAKE_PIPELINE
-
-  // ── Pre-allocate descriptor sets (double-buffered) ────────────────────────
-  // Layout sequence per frame: DEPTHS, NORMALS, Q3, BLUR×4, APPLY
-  VkDescriptorSetLayout frameLayouts[kSetsPerFrame] = {
-    m_setLayouts[CACAO_PASS_PREPARE_DEPTHS],
-    m_setLayouts[CACAO_PASS_PREPARE_NORMALS],
-    m_setLayouts[CACAO_PASS_GENERATE_Q3],
-    m_setLayouts[CACAO_PASS_EDGE_BLUR],
-    m_setLayouts[CACAO_PASS_EDGE_BLUR],
-    m_setLayouts[CACAO_PASS_EDGE_BLUR],
-    m_setLayouts[CACAO_PASS_EDGE_BLUR],
-    m_setLayouts[CACAO_PASS_APPLY],
-  };
-
-  VkDescriptorSetLayout allLayouts[kTotalSets];
-  for (uint32_t f = 0; f < kFrameLag; f++)
-    for (uint32_t s = 0; s < kSetsPerFrame; s++)
-      allLayouts[f * kSetsPerFrame + s] = frameLayouts[s];
-
-  VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-  ai.descriptorPool     = m_descPool;
-  ai.descriptorSetCount = kTotalSets;
-  ai.pSetLayouts        = allLayouts;
-  if (vkd->vkAllocateDescriptorSets(dev, &ai, m_descSets.data()) != VK_SUCCESS)
-    throw DxvkError("CACAO: failed to pre-allocate descriptor sets");
 }
 
-// ── InitResources ──────────────────────────────────────────────────────────────
 void D3D9CacaoRenderer::InitResources(uint32_t w, uint32_t h) {
   DestroyResources();
   m_width  = w;
@@ -1122,8 +932,6 @@ void D3D9CacaoRenderer::Apply(
   BufSizeInfo bsi;
   calcBufSizeInfo(width, height, &bsi);
 
-  const uint32_t frameBase = m_frameIndex * kSetsPerFrame;
-
   // Capture resources by Rc<> (keeps alive through GPU execution)
   Rc<DxvkImage>  deintD    = m_deinterleavedDepths;
   Rc<DxvkImage>  deintN    = m_deinterleavedNormals;
@@ -1176,11 +984,6 @@ void D3D9CacaoRenderer::Apply(
   auto   vkd        = m_device->vkd();
   auto   pipelines  = m_pipelines.data();
   auto   pipeLayouts= m_pipelineLayouts.data();
-  // Descriptor sets for this frame (frameBase..frameBase+kSetsPerFrame-1)
-  VkDescriptorSet frameSets[kSetsPerFrame];
-  for (uint32_t i = 0; i < kSetsPerFrame; i++)
-    frameSets[i] = m_descSets[frameBase + i];
-
   uint32_t w          = width;
   uint32_t h          = height;
   BufSizeInfo bsiCopy = bsi;
@@ -1199,13 +1002,21 @@ void D3D9CacaoRenderer::Apply(
   if (doReadback)
     m_readbackPending = true;
 
+  CacaoSamplerIndices samplerIdx = {
+    m_heapSamplers[0]->getDescriptor().samplerIndex,
+    m_heapSamplers[1]->getDescriptor().samplerIndex,
+    m_heapSamplers[2]->getDescriptor().samplerIndex,
+    m_heapSamplers[3]->getDescriptor().samplerIndex,
+    m_heapSamplers[4]->getDescriptor().samplerIndex,
+  };
+
   device->EmitCs([
     vkd, depthImage = std::move(depthImage), depthCopy,
     deintD, deintN, ssaoPing, ssaoPong, impMap, impMapP, aoFinal, aoUavView, loadCnt, cb,
     pipelines, pipeLayouts,
     vDeintDUav, vDeintDSrv, vDeintNUav, vDeintNSrv, vDeintDMips,
     vPingSrv, vPingUav, vPongSrv, vPongUav, vImpSrv, vLoadSrv,
-    frameSets /* copied by value (array of VkDescriptorSet handles) */,
+    samplerIdx /* heap indices by value */,
     w, h, bsiCopy, quality, debugFill,
     readbackBuf, doReadback, doDump, useSnapInput
   ] (DxvkContext* cs) mutable {
@@ -1277,28 +1088,33 @@ void D3D9CacaoRenderer::Apply(
     };
 
     // ── Helper: update a single image descriptor write ────────────────────
-    auto imgWrite = [&](VkDescriptorSet ds, uint32_t binding,
-                        VkDescriptorType type, const VkDescriptorImageInfo& info,
-                        uint32_t arrayElement = 0) {
-      VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-      w.dstSet          = ds;
-      w.dstBinding      = binding;
-      w.dstArrayElement = arrayElement;
-      w.descriptorCount = 1;
-      w.descriptorType  = type;
-      w.pImageInfo      = &info;
-      vkd->vkUpdateDescriptorSets(vkdev, 1, &w, 0, nullptr);
+    // Mid-frame миграция: биндинг через bindResources (heap/legacy автоматически).
+    // Пуш-константы — индексы сэмплеров heap (CacaoSamplerIndices, 20 байт).
+    auto bindPass = [&](CacaoPass pass,
+                        const DxvkDescriptorWrite* writes, uint32_t count) {
+      cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[pass]);
+      cmd->bindResources(DxvkCmdBuffer::ExecBuffer, pipeLayouts[pass],
+        count, writes, sizeof(CacaoSamplerIndices), &samplerIdx);
     };
-
-    auto bufWrite = [&](VkDescriptorSet ds, uint32_t binding,
-                        const VkDescriptorBufferInfo& info) {
-      VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-      w.dstSet         = ds;
-      w.dstBinding     = binding;
-      w.descriptorCount= 1;
+    auto imgW = [&](const Rc<DxvkImageView>& v) {
+      DxvkDescriptorWrite w = { };
+      w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      w.descriptor = v ? v->getDescriptor() : nullptr;
+      return w;
+    };
+    auto stW = [&](const Rc<DxvkImageView>& v) {
+      DxvkDescriptorWrite w = { };
+      w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      w.descriptor = v ? v->getDescriptor() : nullptr;
+      return w;
+    };
+    auto ubW = [&]() {
+      DxvkDescriptorWrite w = { };
       w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-      w.pBufferInfo    = &info;
-      vkd->vkUpdateDescriptorSets(vkdev, 1, &w, 0, nullptr);
+      w.buffer = cb->getSliceInfo();
+      w.buffer.size = sizeof(CacaoConstants);
+      return w;
     };
 
     // ── Shared CB info ─────────────────────────────────────────────────────
@@ -1402,38 +1218,16 @@ void D3D9CacaoRenderer::Apply(
     // PASS 1 — Prepare native depths and mips
     // ════════════════════════════════════════════════════════════════════════
     {
-      VkDescriptorSet ds = frameSets[SET_IDX_DEPTHS];
-
-      VkDescriptorImageInfo depthSrvInfo = { {}, depthSrv->handle(), VK_IMAGE_LAYOUT_GENERAL };
-      imgWrite(ds, B_SRV_DEPTH_IN, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, depthSrvInfo);
-
-      VkDescriptorImageInfo deintDUavInfo = { {}, vDeintDUav->handle(), VK_IMAGE_LAYOUT_GENERAL };
-      imgWrite(ds, B_UAV_DEINT_DEPTHS, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, deintDUavInfo);
-
-      // depth mips UAV: 4 array elements, one per mip level
-      // (descriptor array binding with count=4, each element = one mip view)
-      std::array<VkDescriptorImageInfo, 4> mipInfos = {};
+      std::array<DxvkDescriptorWrite, 9> writes = { };
+      writes[0] = imgW(depthSrv);
+      writes[1] = imgW(nullptr);                 // normalIn: не используется
       for (uint32_t m = 0; m < 4; m++)
-        mipInfos[m] = { {}, vDeintDMips[m]->handle(), VK_IMAGE_LAYOUT_GENERAL };
-      VkWriteDescriptorSet mipWrite = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-      mipWrite.dstSet          = ds;
-      mipWrite.dstBinding      = B_UAV_DEPTH_MIPS;
-      mipWrite.descriptorCount = 4;
-      mipWrite.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-      mipWrite.pImageInfo      = mipInfos.data();
-      vkd->vkUpdateDescriptorSets(vkdev, 1, &mipWrite, 0, nullptr);
+        writes[2 + m] = stW(vDeintDMips[m]);
+      writes[6] = stW(vDeintDUav);
+      writes[7] = stW(nullptr);                  // deintN: не используется
+      writes[8] = ubW();
 
-      bufWrite(ds, B_CB_CACAO, cbInfo);
-
-      cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
-        VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[CACAO_PASS_PREPARE_DEPTHS]);
-      VkBindDescriptorSetsInfo bindInfo = { VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO };
-      bindInfo.stageFlags          = VK_SHADER_STAGE_COMPUTE_BIT;
-      bindInfo.layout            = pipeLayouts[CACAO_PASS_PREPARE_DEPTHS];
-      bindInfo.firstSet          = 0;
-      bindInfo.descriptorSetCount = 1;
-      bindInfo.pDescriptorSets   = &ds;
-      cmd->cmdBindDescriptorSets(DxvkCmdBuffer::ExecBuffer, &bindInfo);
+      bindPass(CACAO_PASS_PREPARE_DEPTHS, writes.data(), uint32_t(writes.size()));
       cmd->cmdDispatch(DxvkCmdBuffer::ExecBuffer,
         dispatchSize(TG, bsiCopy.deinterleavedDepthBufferWidth),
         dispatchSize(TG, bsiCopy.deinterleavedDepthBufferHeight),
@@ -1445,26 +1239,18 @@ void D3D9CacaoRenderer::Apply(
     // PASS 2 — Prepare normals from depth
     // ════════════════════════════════════════════════════════════════════════
     {
-      VkDescriptorSet ds = frameSets[SET_IDX_NORMALS];
+      std::array<DxvkDescriptorWrite, 9> writes = { };
+      writes[0] = imgW(depthSrv);
+      writes[1] = imgW(nullptr);
+      writes[2] = stW(nullptr);                  // mips: не используются
+      writes[3] = stW(nullptr);
+      writes[4] = stW(nullptr);
+      writes[5] = stW(nullptr);
+      writes[6] = stW(nullptr);
+      writes[7] = stW(vDeintNUav);
+      writes[8] = ubW();
 
-      // Use original depth image for normals computation (GENERAL layout)
-      VkDescriptorImageInfo depthSrvInfo = { {}, depthSrv->handle(), VK_IMAGE_LAYOUT_GENERAL };
-      imgWrite(ds, B_SRV_DEPTH_IN, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, depthSrvInfo);
-
-      VkDescriptorImageInfo deintNUavInfo = { {}, vDeintNUav->handle(), VK_IMAGE_LAYOUT_GENERAL };
-      imgWrite(ds, B_UAV_DEINT_NORMALS, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, deintNUavInfo);
-
-      bufWrite(ds, B_CB_CACAO, cbInfo);
-
-      cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
-        VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[CACAO_PASS_PREPARE_NORMALS]);
-      VkBindDescriptorSetsInfo bindInfo = { VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO };
-      bindInfo.stageFlags          = VK_SHADER_STAGE_COMPUTE_BIT;
-      bindInfo.layout            = pipeLayouts[CACAO_PASS_PREPARE_NORMALS];
-      bindInfo.firstSet          = 0;
-      bindInfo.descriptorSetCount = 1;
-      bindInfo.pDescriptorSets   = &ds;
-      cmd->cmdBindDescriptorSets(DxvkCmdBuffer::ExecBuffer, &bindInfo);
+      bindPass(CACAO_PASS_PREPARE_NORMALS, writes.data(), uint32_t(writes.size()));
       cmd->cmdDispatch(DxvkCmdBuffer::ExecBuffer,
         dispatchSize(TG, bsiCopy.ssaoBufferWidth),
         dispatchSize(TG, bsiCopy.ssaoBufferHeight),
@@ -1495,32 +1281,16 @@ void D3D9CacaoRenderer::Apply(
         : quality == CacaoQuality::Low    ? CACAO_PASS_GENERATE_Q1
         :                                   CACAO_PASS_GENERATE_Q2;
 
-      VkDescriptorSet ds = frameSets[SET_IDX_Q3];
+      std::array<DxvkDescriptorWrite, 7> writes = { };
+      writes[0] = imgW(vLoadSrv);
+      writes[1] = imgW(vDeintDSrv);
+      writes[2] = imgW(vDeintNSrv);
+      writes[3] = imgW(vPongSrv);              // read pong (не используется неадаптивной веткой)
+      writes[4] = imgW(vImpSrv);               // importance: занулён перед пассом
+      writes[5] = stW(vPingUav);               // write ping
+      writes[6] = ubW();
 
-      VkDescriptorImageInfo deintDInfo  = { {}, vDeintDSrv->handle(),  VK_IMAGE_LAYOUT_GENERAL };
-      VkDescriptorImageInfo deintNInfo  = { {}, vDeintNSrv->handle(),  VK_IMAGE_LAYOUT_GENERAL };
-      VkDescriptorImageInfo pingUavInfo = { {}, vPingUav->handle(),    VK_IMAGE_LAYOUT_GENERAL };
-      VkDescriptorImageInfo pongSrvInfo = { {}, vPongSrv->handle(),    VK_IMAGE_LAYOUT_GENERAL };
-      VkDescriptorImageInfo impInfo     = { {}, vImpSrv->handle(),     VK_IMAGE_LAYOUT_GENERAL };
-      VkDescriptorImageInfo loadInfo    = { {}, vLoadSrv->handle(),    VK_IMAGE_LAYOUT_GENERAL };
-
-      imgWrite(ds, B_SRV_LOAD_COUNTER,          VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  loadInfo);
-      imgWrite(ds, B_SRV_DEINTERLEAVED_DEPTHS,  VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  deintDInfo);
-      imgWrite(ds, B_SRV_DEINTERLEAVED_NORMALS, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  deintNInfo);
-      imgWrite(ds, B_SRV_SSAO_PING,             VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  pongSrvInfo); // read pong
-      imgWrite(ds, B_SRV_IMPORTANCE_MAP,        VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  impInfo);
-      imgWrite(ds, B_UAV_SSAO_PING,             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  pingUavInfo); // write ping
-      bufWrite(ds, B_CB_CACAO, cbInfo);
-
-      cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
-        VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[generatePass]);
-      VkBindDescriptorSetsInfo bindInfo = { VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO };
-      bindInfo.stageFlags          = VK_SHADER_STAGE_COMPUTE_BIT;
-      bindInfo.layout            = pipeLayouts[generatePass];
-      bindInfo.firstSet          = 0;
-      bindInfo.descriptorSetCount = 1;
-      bindInfo.pDescriptorSets   = &ds;
-      cmd->cmdBindDescriptorSets(DxvkCmdBuffer::ExecBuffer, &bindInfo);
+      bindPass(generatePass, writes.data(), uint32_t(writes.size()));
       cmd->cmdDispatch(DxvkCmdBuffer::ExecBuffer,
         dispatchSize(TG, bsiCopy.ssaoBufferWidth),
         dispatchSize(TG, bsiCopy.ssaoBufferHeight),
@@ -1535,30 +1305,15 @@ void D3D9CacaoRenderer::Apply(
 
     for (uint32_t blurPass = 0; blurPass < numBlurPasses; blurPass++) {
       bool even = (blurPass % 2) == 0;
-      Rc<DxvkImage>& src = even ? ssaoPing : ssaoPong;
-      Rc<DxvkImage>& dst = even ? ssaoPong : ssaoPing;
-
-      VkDescriptorSet ds = frameSets[SET_IDX_BLUR_0 + blurPass];
-
       const Rc<DxvkImageView>& srcView = even ? vPingSrv : vPongSrv;
       const Rc<DxvkImageView>& dstView = even ? vPongUav : vPingUav;
 
-      VkDescriptorImageInfo srcInfo = { {}, srcView->handle(), VK_IMAGE_LAYOUT_GENERAL };
-      VkDescriptorImageInfo dstInfo = { {}, dstView->handle(), VK_IMAGE_LAYOUT_GENERAL };
+      std::array<DxvkDescriptorWrite, 3> writes = { };
+      writes[0] = imgW(srcView);
+      writes[1] = stW(dstView);
+      writes[2] = ubW();
 
-      imgWrite(ds, B_SRV_SSAO_PING_APPLY, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  srcInfo);
-      imgWrite(ds, B_UAV_SSAO_PONG,       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  dstInfo);
-      bufWrite(ds, B_CB_CACAO, cbInfo);
-
-      cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
-        VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[CACAO_PASS_EDGE_BLUR]);
-      VkBindDescriptorSetsInfo bindInfo = { VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO };
-      bindInfo.stageFlags          = VK_SHADER_STAGE_COMPUTE_BIT;
-      bindInfo.layout            = pipeLayouts[CACAO_PASS_EDGE_BLUR];
-      bindInfo.firstSet          = 0;
-      bindInfo.descriptorSetCount = 1;
-      bindInfo.pDescriptorSets   = &ds;
-      cmd->cmdBindDescriptorSets(DxvkCmdBuffer::ExecBuffer, &bindInfo);
+      bindPass(CACAO_PASS_EDGE_BLUR, writes.data(), uint32_t(writes.size()));
       cmd->cmdDispatch(DxvkCmdBuffer::ExecBuffer,
         dispatchSize(TG, bsiCopy.ssaoBufferWidth),
         dispatchSize(TG, bsiCopy.ssaoBufferHeight),
@@ -1574,32 +1329,15 @@ void D3D9CacaoRenderer::Apply(
     // Compositing is done in the present blitter via binding=4 / c_composite_ao=true.
     // ════════════════════════════════════════════════════════════════════════
     {
-      // After the blur loop the result sits in the buffer written by the
-      // LAST blur pass: generate wrote ssaoPing, each pass swaps dst, so
-      // after an even pass count the result is back in ssaoPing. Reading
-      // the wrong buffer (a previous intermediate) fed stale AO into the
-      // composite and oscillated through the Q3 temporal history.
-      Rc<DxvkImage>& finalSsao = (numBlurPasses % 2 == 0) ? ssaoPing : ssaoPong;
-      const Rc<DxvkImageView>& ssaoSrv = (numBlurPasses % 2 == 0) ? vPingSrv : vPongSrv;
+      // После чётного числа blur-проходов результат в ssaoPing.
+      Rc<DxvkImageView>& ssaoSrv = vPingSrv;
 
-      VkDescriptorSet ds = frameSets[SET_IDX_APPLY];
+      std::array<DxvkDescriptorWrite, 3> writes = { };
+      writes[0] = imgW(ssaoSrv);
+      writes[1] = stW(aoUavView);
+      writes[2] = ubW();
 
-      VkDescriptorImageInfo ssaoSrvInfo = { {}, ssaoSrv->handle(), VK_IMAGE_LAYOUT_GENERAL };
-      VkDescriptorImageInfo aoUavInfo   = { {}, aoUavView->handle(), VK_IMAGE_LAYOUT_GENERAL };
-
-      imgWrite(ds, B_SRV_SSAO_PING_APPLY, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  ssaoSrvInfo);
-      imgWrite(ds, B_UAV_OUTPUT,          VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  aoUavInfo);
-      bufWrite(ds, B_CB_CACAO, cbInfo);
-
-      cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
-        VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[CACAO_PASS_APPLY]);
-      VkBindDescriptorSetsInfo bindInfo = { VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO };
-      bindInfo.stageFlags          = VK_SHADER_STAGE_COMPUTE_BIT;
-      bindInfo.layout            = pipeLayouts[CACAO_PASS_APPLY];
-      bindInfo.firstSet          = 0;
-      bindInfo.descriptorSetCount = 1;
-      bindInfo.pDescriptorSets   = &ds;
-      cmd->cmdBindDescriptorSets(DxvkCmdBuffer::ExecBuffer, &bindInfo);
+      bindPass(CACAO_PASS_APPLY, writes.data(), uint32_t(writes.size()));
       cmd->cmdDispatch(DxvkCmdBuffer::ExecBuffer,
         dispatchSize(TG, w), dispatchSize(TG, h), 1);
     }
