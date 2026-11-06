@@ -1621,6 +1621,12 @@ namespace dxvk {
     // Which SetTransform branch triggered the current chain attempt:
     // 1 = off-aspect perspective rejection (water-type), 2 = ortho (UI).
     uint32_t                        m_cacaoChainSignal       = 0;
+    // Re-run support: L2's world layout renders terrain, a UI-ortho fragment,
+    // and only then pawns/props with their own world projection. After the
+    // first chain, a later aspect-OK projection re-arms the chain so it
+    // re-fires on the fuller scene depth (max 3 chains per present).
+    bool                            m_cacaoChainRerunArmed   = false;
+    uint32_t                        m_cacaoChainReruns       = 0;
     void                            TryCaptureCacaoSceneDepth();
     void                            ApplyCACAOAtWorldEnd();
     // Single-sample resolve target for MSAA depth buffers.
