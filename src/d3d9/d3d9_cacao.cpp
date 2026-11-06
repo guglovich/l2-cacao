@@ -34,6 +34,10 @@
 #include "../dxvk/dxvk_cmdlist.h"
 #include "../dxvk/dxvk_image.h"
 #include "../dxvk/dxvk_buffer.h"
+#include "../dxvk/dxvk_util.h"
+
+#include "cacao_spirv/dxvk_cacao_mid_vert_pass.h"
+#include "cacao_spirv/dxvk_cacao_mid_frag_pass.h"
 
 #include <cmath>
 #include <cstring>
@@ -620,6 +624,7 @@ void D3D9CacaoRenderer::InitResources(uint32_t w, uint32_t h) {
 
 // ── DestroyResources ───────────────────────────────────────────────────────────
 void D3D9CacaoRenderer::DestroyResources() {
+  DestroyMidComposite();
   m_deinterleavedDepths  = nullptr;
   m_deinterleavedNormals = nullptr;
   m_ssaoPing             = nullptr;
@@ -1723,6 +1728,289 @@ void D3D9CacaoRenderer::Apply(
     cmd->track(aoFinal,    DxvkAccess::Write);
     cmd->track(loadCnt,    DxvkAccess::Write);
     cmd->track(cb,         DxvkAccess::Read);
+  });
+}
+
+
+// ── Mid-frame composite (docs/DX9_VULKAN_WINE_PATHS.md §4.B) ─────────────────
+//
+// Bakes color * AO into the D3D9 back buffer at the world->UI boundary, before
+// the game draws its interface. Replaces the present blitter composite when
+// enabled: UI pixels are never darkened, and letterbox/scaling artifacts are
+// impossible by construction (the composite happens at back-buffer resolution).
+void D3D9CacaoRenderer::InitMidComposite(VkFormat format, VkExtent3D extent) {
+  auto vkd = m_device->vkd();
+
+  DestroyMidComposite();
+
+  // Descriptor layout: set 1 bindings 0/1 = scene copy + AO result,
+  // samplers come from the sampler heap (set 0), params via push constants.
+  static const std::array<DxvkDescriptorSetLayoutBinding, 2> bindings = {{
+    { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
+    { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT },
+  }};
+
+  m_midLayout = m_device->createBuiltInPipelineLayout(
+    DxvkPipelineLayoutFlag::UsesSamplerHeap,
+    VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(MidCompositeParams),
+    bindings.size(), bindings.data());
+
+  DxvkSamplerKey samplerInfo = { };
+  samplerInfo.setFilter(VK_FILTER_LINEAR, VK_FILTER_LINEAR,
+    VK_SAMPLER_MIPMAP_MODE_NEAREST);
+  samplerInfo.setAddressModes(
+    VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+  samplerInfo.setUsePixelCoordinates(false);
+  m_midSampler = m_device->createSampler(samplerInfo);
+
+  // Scene copies: one ring slot per frame slot, sized as the back buffer.
+  for (uint32_t i = 0; i < kFrameLag; i++) {
+    DxvkImageCreateInfo ici = { };
+    ici.type        = VK_IMAGE_TYPE_2D;
+    ici.format      = format;
+    ici.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    ici.extent      = extent;
+    ici.numLayers   = 1;
+    ici.mipLevels   = 1;
+    ici.usage       = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.stages      = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    ici.access      = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    ici.tiling      = VK_IMAGE_TILING_OPTIMAL;
+    ici.layout      = VK_IMAGE_LAYOUT_GENERAL;
+    m_sceneCopies[i] = m_device->createImage(ici, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    DxvkImageViewKey vkey = { };
+    vkey.viewType   = VK_IMAGE_VIEW_TYPE_2D;
+    vkey.format     = format;
+    vkey.usage      = VK_IMAGE_USAGE_SAMPLED_BIT;
+    vkey.aspects    = VK_IMAGE_ASPECT_COLOR_BIT;
+    vkey.mipIndex   = 0u;
+    vkey.mipCount   = 1u;
+    vkey.layerIndex = 0u;
+    vkey.layerCount = 1u;
+    m_sceneSrvs[i] = m_sceneCopies[i]->createView(vkey);
+  }
+
+  util::DxvkBuiltInGraphicsState state = { };
+  state.vs = util::DxvkBuiltInShaderStage(DXVK_CACAO_MID_VERT_SPV, nullptr);
+  state.fs = util::DxvkBuiltInShaderStage(DXVK_CACAO_MID_FRAG_SPV, nullptr);
+  state.colorFormats[0] = format;
+  m_midPipeline = m_device->createBuiltInGraphicsPipeline(m_midLayout, state);
+
+  m_midFormat = format;
+  m_midExtent = extent;
+  m_midInit   = true;
+}
+
+
+void D3D9CacaoRenderer::DestroyMidComposite() {
+  auto vkd = m_device->vkd();
+  if (m_midPipeline) {
+    vkd->vkDestroyPipeline(vkd->device(), m_midPipeline, nullptr);
+    m_midPipeline = VK_NULL_HANDLE;
+  }
+  for (uint32_t i = 0; i < kFrameLag; i++) {
+    m_sceneSrvs[i]   = nullptr;
+    m_sceneCopies[i] = nullptr;
+  }
+  m_bbRtv    = nullptr;
+  m_bbImage  = nullptr;
+  m_midSampler = nullptr;
+  m_midLayout  = nullptr;
+  m_midInit  = false;
+}
+
+
+void D3D9CacaoRenderer::CompositeMidFrame(
+    D3D9DeviceEx*        device,
+    const Rc<DxvkImage>& backBuffer,
+    float                darkMask,
+    float                contactT0,
+    float                contactT1,
+    float                contactStrength,
+    bool                 debugView) {
+  if (!m_initialized || backBuffer == nullptr)
+    return;
+
+  VkFormat  bbFormat = backBuffer->info().format;
+  VkExtent3D bbExtent = backBuffer->info().extent;
+
+  if (!m_midInit || m_midFormat != bbFormat
+   || m_midExtent.width != bbExtent.width
+   || m_midExtent.height != bbExtent.height
+   || m_bbImage != backBuffer)
+    InitMidComposite(bbFormat, bbExtent);
+
+  if (!m_midInit)
+    return;
+
+  // RTV on the back buffer (cached per image instance)
+  if (m_bbImage != backBuffer) {
+    DxvkImageViewKey rkey = { };
+    rkey.viewType   = VK_IMAGE_VIEW_TYPE_2D;
+    rkey.format     = bbFormat;
+    rkey.usage      = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    rkey.aspects    = VK_IMAGE_ASPECT_COLOR_BIT;
+    rkey.mipIndex   = 0u;
+    rkey.mipCount   = 1u;
+    rkey.layerIndex = 0u;
+    rkey.layerCount = 1u;
+    m_bbRtv   = backBuffer->createView(rkey);
+    m_bbImage = backBuffer;
+  }
+
+  uint32_t frame  = m_frameIndex;               // same slot Apply just wrote
+  Rc<DxvkImage>     sceneCopy = m_sceneCopies[frame];
+  Rc<DxvkImageView> sceneSrv  = m_sceneSrvs[frame];
+  Rc<DxvkImageView> aoSrv     = m_aoFinalSrvs[frame];
+  VkPipeline  pipeline  = m_midPipeline;
+  const DxvkPipelineLayout* layout = m_midLayout;
+  uint32_t samplerIdx = m_midSampler->getDescriptor().samplerIndex;
+
+  MidCompositeParams params = { };
+  params.srcExtent[0] = int32_t(bbExtent.width);
+  params.srcExtent[1] = int32_t(bbExtent.height);
+  params.samplerScene = samplerIdx;
+  params.darkMask  = darkMask;
+  params.contactT0 = contactT0;
+  params.contactT1 = contactT1;
+  params.contactStrength = contactStrength;
+  params.debugView = debugView ? 1.0f : 0.0f;
+
+  Rc<DxvkImage> bb = backBuffer;
+  device->EmitCs([
+    bb, bbRtv = m_bbRtv, sceneCopy, sceneSrv, aoSrv, pipeline, layout,
+    params
+  ] (DxvkContext* cs) mutable {
+    Rc<DxvkCommandList> cmd = cs->beginExternalRendering();
+
+    VkImageLayout tracked = bb->queryLayout(bb->getAvailableSubresources());
+
+    auto bbBarrier = [&](VkImageLayout oldL, VkImageLayout newL,
+                         VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
+                         VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess) {
+      VkImageMemoryBarrier2 b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+      b.srcStageMask  = srcStage;
+      b.srcAccessMask = srcAccess;
+      b.dstStageMask  = dstStage;
+      b.dstAccessMask = dstAccess;
+      b.oldLayout     = oldL;
+      b.newLayout     = newL;
+      b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      b.image         = bb->handle();
+      b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+      VkDependencyInfo di = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+      di.imageMemoryBarrierCount = 1;
+      di.pImageMemoryBarriers    = &b;
+      cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &di);
+    };
+
+    // Tracked layout -> transfer source for the scene snapshot
+    bbBarrier(tracked, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_READ_BIT,
+      VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+      VK_ACCESS_2_TRANSFER_READ_BIT);
+
+    // Snapshot the back buffer (the pre-UI world image)
+    VkImageCopy2 region = { VK_STRUCTURE_TYPE_IMAGE_COPY_2 };
+    region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.extent         = sceneCopy->info().extent;
+    VkCopyImageInfo2 copyInfo = { VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2 };
+    copyInfo.srcImage       = bb->handle();
+    copyInfo.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    copyInfo.dstImage       = sceneCopy->handle();
+    copyInfo.dstImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    copyInfo.regionCount    = 1;
+    copyInfo.pRegions       = &region;
+    cmd->cmdCopyImage(DxvkCmdBuffer::ExecBuffer, &copyInfo);
+
+    // Transfer source -> color attachment for the composite draw
+    bbBarrier(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+      VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT);
+
+    // Scene copy: transfer write -> shader read
+    {
+      VkImageMemoryBarrier2 sc = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+      sc.srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+      sc.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+      sc.dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+      sc.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+      sc.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
+      sc.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+      sc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      sc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      sc.image         = sceneCopy->handle();
+      sc.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+      VkDependencyInfo di = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+      di.imageMemoryBarrierCount = 1;
+      di.pImageMemoryBarriers    = &sc;
+      cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &di);
+    }
+
+    VkRenderingAttachmentInfo att = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    att.imageView   = bbRtv->handle();
+    att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    att.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
+    att.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo renderInfo = { VK_STRUCTURE_TYPE_RENDERING_INFO };
+    renderInfo.renderArea.offset = { 0u, 0u };
+    renderInfo.renderArea.extent = { sceneCopy->info().extent.width,
+                                     sceneCopy->info().extent.height };
+    renderInfo.layerCount = 1;
+    renderInfo.colorAttachmentCount = 1;
+    renderInfo.pColorAttachments = &att;
+
+    cmd->cmdBeginRendering(DxvkCmdBuffer::ExecBuffer, &renderInfo);
+
+    VkViewport viewport = { };
+    viewport.x = 0.0f; viewport.y = 0.0f;
+    viewport.width  = float(sceneCopy->info().extent.width);
+    viewport.height = float(sceneCopy->info().extent.height);
+    viewport.minDepth = 0.0f; viewport.maxDepth = 1.0f;
+    cmd->cmdSetViewport(1, &viewport);
+
+    VkRect2D scissor = { };
+    scissor.offset = { 0, 0 };
+    scissor.extent = { sceneCopy->info().extent.width,
+                       sceneCopy->info().extent.height };
+    cmd->cmdSetScissor(1, &scissor);
+
+    cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
+      VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+    std::array<DxvkDescriptorWrite, 2> writes = { };
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[0].descriptor     = sceneSrv->getDescriptor();
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[1].descriptor     = aoSrv->getDescriptor();
+
+    cmd->bindResources(DxvkCmdBuffer::ExecBuffer,
+      layout, writes.size(), writes.data(), sizeof(params), &params);
+
+    cmd->cmdDraw(3, 1, 0, 0);
+
+    cmd->cmdEndRendering(DxvkCmdBuffer::ExecBuffer);
+
+    // Restore the tracked layout on the back buffer
+    bbBarrier(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, tracked,
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT,
+      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+      VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+
+    cmd->track(bb,        DxvkAccess::Write);
+    cmd->track(sceneCopy, DxvkAccess::Write);
+    cmd->track(sceneSrv->image(), DxvkAccess::Read);
+    cmd->track(aoSrv->image(),    DxvkAccess::Read);
   });
 }
 

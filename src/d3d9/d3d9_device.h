@@ -821,6 +821,11 @@ namespace dxvk {
     void TryExtractProjectionFromAllConstants();
     void BuildUE2ProjectionMatrix(Matrix4& out, uint32_t width, uint32_t height);
     Rc<DxvkImageView> GetCacaoAoView() {
+      // With the mid-frame composite active the AO is already baked into the
+      // back buffer before the UI draws — the present blitter must not apply
+      // it a second time.
+      if (GetOptions()->cacaoMidComposite)
+        return nullptr;
       return (m_cacao.IsEnabled() && m_cacao.IsInitialized()) ? m_cacao.GetAoView() : nullptr;
     }
     void ToggleCACAO();

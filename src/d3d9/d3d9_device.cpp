@@ -9665,6 +9665,24 @@ namespace dxvk {
     m_cacao.AdvanceFrameIndex();
     m_cacao.Apply(this, depthImg, reinterpret_cast<const float*>(&m_cacaoLastProj),
                   refW, refH, GetOptions()->cacaoDebugFill);
+
+    // Mid-frame composite (docs/DX9_VULKAN_WINE_PATHS.md §4.B): bake AO into
+    // the back buffer right here, before the game draws its interface. The
+    // present blitter composite is bypassed (GetCacaoAoView returns null).
+    if (GetOptions()->cacaoMidComposite && m_implicitSwapchain != nullptr) {
+      D3D9Surface* backBufferSurface = m_implicitSwapchain->GetBackBuffer(0);
+      if (backBufferSurface != nullptr) {
+        Rc<DxvkImage> bbImage = backBufferSurface->GetCommonTexture()->GetImage();
+        if (bbImage != nullptr) {
+          m_cacao.CompositeMidFrame(this, bbImage,
+            GetOptions()->cacaoDarkMask,
+            GetOptions()->cacaoContactT0,
+            GetOptions()->cacaoContactT1,
+            GetOptions()->cacaoContactStrength,
+            GetOptions()->cacaoDebugView);
+        }
+      }
+    }
   }
 
 
