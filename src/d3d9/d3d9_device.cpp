@@ -9604,15 +9604,12 @@ namespace dxvk {
     // fragment); the chain then re-fires with the fuller scene depth.
     if (m_cacaoChainSincePresent && !m_cacaoChainRerunArmed)
       return;
-    // World-layout optimization: when the previous frame needed re-runs
-    // (>= 2 chains), the first chain's depth holds only the terrain and its
-    // result is always overwritten — skip it entirely and wait for the
-    // re-armed chain. Cuts a full compute chain (~33-50% of the world CACAO
-    // cost) per frame. Simple frames (login/lobby: 1 chain) are unaffected;
-    // the flag self-clears after one skipped frame if no re-arm follows.
-    if (!m_cacaoChainSincePresent && !m_cacaoChainRerunArmed
-     && m_cacaoLastChainCount >= 2)
-      return;
+    // NOTE: no first-chain skipping here. A previous attempt skipped the
+    // first chain when the last frame needed re-runs — but that shifts which
+    // UI-ortho each chain lands on (the skip changes the chain->ortho
+    // mapping frame to frame), so the last composite's depth content
+    // alternated between frames and the AO flickered fast (user report
+    // 07.11). The chains must map to consistent UI-ortho indices; run all.
     if (!m_cacaoHasValidProj)
       return;
 
