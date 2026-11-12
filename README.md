@@ -1,23 +1,25 @@
 # l2-cacao
 
-**DXVK 3.1 fork with AMD FidelityFX CACAO (screen-space ambient occlusion) for
-D3D9 games under Wine — built for and verified on Lineage 2 (UE2 engine).**
+**A standalone Vulkan-based D3D9 driver add-on for Wine that adds AMD
+FidelityFX CACAO (screen-space ambient occlusion) to D3D9 games — built for
+and verified on Lineage 2 (UE2 engine).**
 
 > Русская версия ниже.
 
 ## What is this
 
-A fork of [DXVK](https://github.com/doitsujin/dxvk) (base v3.1) that injects
-the full FidelityFX CACAO compute pipeline into the D3D9 device: it captures
+The project ships its own D3D9 driver for Wine with the full FidelityFX
+CACAO compute pipeline built into the device: it captures
 the game's depth buffer, runs the SSAO chain (prepare → generate → edge-aware
 blur → bilateral apply) and bakes the result into the back buffer before the
 game's UI draws. Verified working on Lineage 2 (login, character select, and
 the game world) under Wine on AMD RADV; should work on any Vulkan 1.3 GPU.
 
-## Why a fork
+## Why a driver-level injection
 
-A D3D9 game cannot reach its own depth buffer through the API, and DXVK does
-not expose it either. The depth is captured at the DXVK driver level, which
+A D3D9 game cannot reach its own depth buffer through the API, and neither
+Wine's D3D9 nor external injectors expose it reliably. The depth is captured
+at the driver level, which
 makes CACAO's multi-pass compute chain possible — ReShade/vkBasalt-style
 injections cannot do this reliably for D3D9 (known depth access/flicker
 limitations).
@@ -63,6 +65,14 @@ Deploy `d3d9.dll` next to the game exe and run with
 `WINEDLLOVERRIDES="d3d9=n,b"`. Do not replace wine's own `dxgi.dll`
 (L2 server integrity checks).
 
+## Base and licensing
+
+The rendering core is built on DXVK v3.1 sources
+([doitsujin/dxvk](https://github.com/doitsujin/dxvk), LGPL-2.1) — included in
+the initial commit of this repository; this repository is a standalone
+project, not a DXVK fork. `dxvk/` is used strictly as the D3D9→Vulkan
+acceleration base for the AO pipeline.
+
 ## Repository layout
 
 - `src/d3d9/d3d9_cacao.{cpp,h}` — the CACAO renderer: Vulkan compute chain,
@@ -89,8 +99,10 @@ not re-lit.
 
 # l2-cacao (рус.)
 
-Форк DXVK 3.1 с внедрённым AMD FidelityFX CACAO (SSAO) для D3D9-игр под
-Wine, собран и проверен на Lineage 2 (UE2). Глубина буфера захватывается на
+Самостоятельный D3D9-драйвер для Wine с внедрённым AMD FidelityFX CACAO
+(SSAO), собран и проверен на Lineage 2 (UE2). Ядро рендеринга построено на
+исходниках DXVK v3.1 (включены в базовый коммит); репозиторий — отдельный
+проект, а не форк DXVK. Глубина буфера захватывается на
 уровне драйвера DXVK, CACAO считается в Vulkan compute-пайплайне и
 запекается в backbuffer до отрисовки UI.
 
